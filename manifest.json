@@ -1,0 +1,19 @@
+{
+  "name": "Run v2",
+  "short_name": "Run",
+  "description": "Run v2 — غرف ومحادثات دائمة ومكالمات مشفرة",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#171310",
+  "theme_color": "#171310",
+  "icons": [
+    {
+      "src": "./icon-run-v2.svg",
+      "sizes": "128x128 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

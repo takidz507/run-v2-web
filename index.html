@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="ar" dir="rtl" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#171310" />
+    <title>Run v2</title>
+    <link rel="icon" type="image/svg+xml" href="./icon-run-v2.svg" />
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <!-- Official Matrix libolm WebAssembly SDK -->
+    <script src="https://cdn.jsdelivr.net/npm/@matrix-org/olm@3.2.15/olm.js"></script>
+  </head>
+  <body>
+    <main class="app-shell" id="appShell">
+      <!-- Transient Status / Error Toast -->
+      <div class="status-toast hidden" id="statusToast" role="status" aria-live="polite">
+        <span id="statusToastText"></span>
+        <button type="button" id="btnCloseToast" aria-label="إغلاق التنبيه">✕</button>
+      </div>
+
+      <div class="screens">
+        <!-- ==================== 1. LOGIN & IN-APP UIAA REGISTRATION ==================== -->
+        <section class="screen active" id="scr-login">
+          <div class="login-body">
+            <div class="brand-row">
+              <div class="mark" aria-hidden="true">
+                <!-- Approved Run v2 Icon: Simplified Golden-Amber R on Warm Night #171310 -->
+                <svg viewBox="0 0 128 128" fill="none">
+                  <rect width="128" height="128" rx="28" fill="#171310" />
+                  <path
+                    d="M40 30H69C82.8 30 92 38.2 92 50.5C92 60.1 86.1 67.1 76.6 69.8L92.4 95.2C93.5 97 92.2 99.2 90.1 99.2H77.8C76.4 99.2 75.1 98.5 74.4 97.3L59.8 72.2H53.5V96.5C53.5 98 52.3 99.2 50.8 99.2H40C38.5 99.2 37.3 98 37.3 96.5V32.7C37.3 31.2 38.5 30 40 30ZM53.5 43.2V59.2H67.4C73.6 59.2 77.4 55.9 77.4 51.1C77.4 46.4 73.6 43.2 67.4 43.2H53.5Z"
+                    fill="#E8A33D"
+                  />
+                  <path d="M53.5 59.2L66.5 72.2H59.8L53.5 64.5V59.2Z" fill="#C48222" />
+                </svg>
+              </div>
+              <div>
+                <h2 id="authHeading">مرحبًا بعودتك إلى Run</h2>
+                <div style="font-size: 12px; color: var(--app-ink-soft)">
+                  حساب واحد لغرفك ومحادثاتك الدائمة المشفرة
+                </div>
+              </div>
+            </div>
+
+            <!-- Mode Switcher: Login vs Register -->
+            <div class="seg" role="tablist" aria-label="تسجيل الدخول أو إنشاء حساب">
+              <button type="button" id="tabModeLogin" class="on">تسجيل الدخول</button>
+              <button type="button" id="tabModeRegister">إنشاء حساب جديد</button>
+            </div>
+
+            <div class="auth-error-box" id="authErrorBox" style="display: none"></div>
+
+            <!-- Username Field -->
+            <div class="field">
+              <label for="inpAuthUser">اسم المستخدم</label>
+              <div class="box" dir="ltr">
+                <span class="suffix">@</span>
+                <input
+                  id="inpAuthUser"
+                  class="ltr"
+                  type="text"
+                  placeholder="username"
+                  autocomplete="username"
+                />
+              </div>
+              <div class="hint">
+                حروف إنجليزية صغيرة وأرقام — يصبح معرف حسابك في Run بصيغة
+                <span dir="ltr" id="handlePreview">@username</span>
+              </div>
+            </div>
+
+            <!-- Optional Display Name (Registration Only) -->
+            <div class="field" id="fieldDisplayName" style="display: none">
+              <label for="inpAuthDisplayName">الاسم الظاهر <span style="opacity: 0.7">(اختياري)</span></label>
+              <div class="box">
+                <input
+                  id="inpAuthDisplayName"
+                  type="text"
+                  placeholder="مثال: تقي الدين"
+                  autocomplete="name"
+                />
+              </div>
+            </div>
+
+            <!-- Password Field -->
+            <div class="field">
+              <label for="inpAuthPass">كلمة السر</label>
+              <div class="box">
+                <input
+                  id="inpAuthPass"
+                  class="ltr"
+                  type="password"
+                  placeholder="••••••••"
+                  autocomplete="current-password"
+                />
+              </div>
+            </div>
+
+            <!-- Email Field (Registration Only — for in-app UIAA m.login.email.identity) -->
+            <div class="field" id="fieldRegEmail" style="display: none">
+              <label for="inpAuthEmail">البريد الإلكتروني (لتأكيد إنشاء الحساب)</label>
+              <div class="box" dir="ltr">
+                <input
+                  id="inpAuthEmail"
+                  class="ltr"
+                  type="email"
+                  placeholder="name@example.com"
+                  autocomplete="email"
+                />
+              </div>
+              <div class="hint">
+                يُستخدم لإكمال تحقق إنشاء الحساب داخل تطبيق Run مباشرة دون مغادرة التطبيق.
+              </div>
+            </div>
+
+            <!-- In-App Multi-Stage UIAA Verification Card (reCAPTCHA + Email Identity) -->
+            <div class="uiaa-card" id="uiaaCard" style="display: none">
+              <h3 id="uiaaStageTitle">إكمال التحقق لإنشاء الحساب</h3>
+              <div class="uiaa-steps" id="uiaaStepsBadges"></div>
+              <p id="uiaaStageDesc"></p>
+
+              <!-- Stage 1: reCAPTCHA Container -->
+              <div id="uiaaRecaptchaSection" style="display: none">
+                <div class="recaptcha-wrap" id="uiaaRecaptchaWidget"></div>
+              </div>
+
+              <!-- Stage 2: Email Verification Container -->
+              <div id="uiaaEmailSection" style="display: none">
+                <div class="field" style="margin-bottom: 8px">
+                  <label for="inpEmailVerifyCode">
+                    رمز التحقق من البريد <span style="opacity: 0.75">(أو اضغط رابط التأكيد في رسالتك ثم اضغط الزر أدناه)</span>
+                  </label>
+                  <div class="box" dir="ltr">
+                    <input
+                      id="inpEmailVerifyCode"
+                      class="ltr"
+                      type="text"
+                      placeholder="رمز التحقق (إن وجد في الرسالة)"
+                    />
+                  </div>
+                </div>
+                <div style="display: flex; gap: 8px; margin-top: 8px">
+                  <button type="button" class="primary-btn" id="btnConfirmEmailStage" style="height: 42px; font-size: 13.5px">
+                    تأكيد البريد وإكمال التسجيل
+                  </button>
+                  <button type="button" class="secondary-btn" id="btnResendEmailStage" style="width: auto; padding: 0 14px">
+                    إعادة الإرسال
+                  </button>
+                </div>
+              </div>
+
+              <!-- Stage: Terms Acceptance (if requested by server) -->
+              <div id="uiaaTermsSection" style="display: none">
+                <button type="button" class="primary-btn" id="btnAcceptTermsStage" style="height: 42px; font-size: 13.5px">
+                  الموافقة والمتابعة
+                </button>
+              </div>
+            </div>
+
+            <button class="primary-btn" id="btnSubmitAuth" type="button">تسجيل الدخول</button>
+
+            <div class="login-notes">
+              <div class="login-note">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6l7-3Z" />
+                  <path d="M9 12l2 2 4-4" />
+                </svg>
+                <span>
+                  <b>تشفير طرف-لطرف (Olm/Megolm):</b> رسائلك في الغرف المشفرة تُشفر وتُتبادل مفاتيحها تلقائيًا مع جميع أجهزة الأعضاء.
+                </span>
+              </div>
+              <div class="login-note">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="5" y="11" width="14" height="9" rx="2" />
+                  <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+                </svg>
+                <span>
+                  <b>رمز PIN من 6 أرقام:</b> يشفر نسخة مفاتيح محادثاتك احتياطيًا لتستعيدها على أي جهاز آخر.
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== 2. 6-DIGIT PIN SCREEN ==================== -->
+        <section class="screen" id="scr-pin">
+          <div class="pin-body">
+            <div class="lock" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="5" y="11" width="14" height="9" rx="2" />
+                <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+                <circle cx="12" cy="15.5" r="1.4" fill="currentColor" stroke="none" />
+              </svg>
+            </div>
+            <h2 id="pinTitle">أنشئ رمز PIN من 6 أرقام</h2>
+            <p id="pinSubtitle">
+              هذا الرمز منفصل عن كلمة السر ويشفر نسخة مفاتيح محادثاتك (Megolm) احتياطيًا لاستعادتها على أي جهاز آخر.
+            </p>
+            <div class="pin-warning">
+              تنبيه مهم: فقدان رمز PIN يعني فقدان النسخة الاحتياطية لمفاتيح التشفير نهائيًا ولا يمكن استرجاعها.
+            </div>
+            <div class="pin-dots" id="pinDots" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div class="pin-status" id="pinStatus"></div>
+            <div class="pad" id="pinPad">
+              <button type="button" data-d="1">1</button>
+              <button type="button" data-d="2">2</button>
+              <button type="button" data-d="3">3</button>
+              <button type="button" data-d="4">4</button>
+              <button type="button" data-d="5">5</button>
+              <button type="button" data-d="6">6</button>
+              <button type="button" data-d="7">7</button>
+              <button type="button" data-d="8">8</button>
+              <button type="button" data-d="9">9</button>
+              <span></span>
+              <button type="button" data-d="0">0</button>
+              <button type="button" class="util" id="btnPinBackspace" aria-label="حذف رقم">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 6H8l-5 6 5 6h13a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1Z" />
+                  <path d="M17 9.5l-5 5M12 9.5l5 5" />
+                </svg>
+              </button>
+            </div>
+            <button class="ghost-link" id="btnPinSkip" type="button">المتابعة إلى الغرف</button>
+          </div>
+        </section>
+
+        <!-- ==================== 3. PIN RESTORE SUCCESS ==================== -->
+        <section class="screen" id="scr-restored">
+          <div class="pin-body" style="justify-content: center">
+            <div
+              class="lock"
+              style="width: 68px; height: 68px; background: rgba(61, 157, 99, 0.18); color: var(--online)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
+                <path d="M4.5 12.5 10 18 19.5 6.5" />
+              </svg>
+            </div>
+            <h2>رجعت محادثاتك</h2>
+            <p id="restoredSummaryText" style="margin-bottom: 20px">
+              رمز PIN فكّ تشفير نسخة المفاتيح الاحتياطية، وتمت استعادة مفاتيح غرفك على هذا المتصفح.
+            </p>
+            <button class="primary-btn" id="btnOpenRoomsAfterRestore" type="button" style="max-width: 240px">
+              فتح الغرف
+            </button>
+          </div>
+        </section>
+
+        <!-- ==================== 4. ROOMS SCREEN ==================== -->
+        <section class="screen" id="scr-rooms">
+          <div class="app-head">
+            <div class="head-row">
+              <div class="grow">
+                <h2>الغرف</h2>
+                <p>غرف دائمة — التاريخ محفوظ في حسابك، لا يضيع بإغلاق التطبيق</p>
+              </div>
+              <button
+                class="create-fab"
+                id="btnOpenCreateRoom"
+                type="button"
+                aria-label="إنشاء غرفة جماعية جديدة"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <button
+            class="search-bar-btn"
+            id="btnOpenSearchFromRooms"
+            type="button"
+            aria-label="ابحث عن صديق أو غرفة"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7" />
+              <path d="M20 20l-3.5-3.5" />
+            </svg>
+            <span style="flex: 1; font-size: 13px">
+              ابحث عن صديق بالاسم أو <span dir="ltr">@username</span>، أو غرفة بالاسم أو الكود…
+            </span>
+          </button>
+
+          <!-- Space Filter Orbs -->
+          <div class="spaces" role="list" aria-label="تصفية الغرف">
+            <button class="space sel" type="button" data-filter="ALL">
+              <span class="ring" style="background: var(--accent); color: var(--accent-ink)">الكل</span>
+              <small>الكل</small>
+            </button>
+            <button class="space" type="button" data-filter="GROUPS">
+              <span class="ring" style="background: #8a6d3b">غرف</span>
+              <small>مجموعات</small>
+            </button>
+            <button class="space" type="button" data-filter="DIRECT">
+              <span class="ring" style="background: #3f6d8e">خاص</span>
+              <small>الخاصة</small>
+            </button>
+            <button class="space" type="button" id="btnSpaceNewRoom">
+              <span class="ring" style="background: var(--app-surface-2); color: var(--app-ink-soft)">+</span>
+              <small>جديدة</small>
+            </button>
+          </div>
+
+          <div id="roomsListContainer"></div>
+        </section>
+
+        <!-- ==================== 5. FULL-SCREEN CHAT ==================== -->
+        <section class="screen" id="scr-chat">
+          <div class="chat-head">
+            <button class="icon-btn" id="btnChatBack" type="button" aria-label="رجوع">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                <path d="M9 5l7 7-7 7" />
+              </svg>
+            </button>
+            <span
+              class="avatar"
+              id="chatHeaderAvatar"
+              style="width: 40px; height: 40px; background: #8a6d3b; font-size: 15px"
+              >R</span
+            >
+            <div class="meta" id="btnOpenRoomInfoFromHeader">
+              <div class="name">
+                <span id="chatHeaderName">غرفة Run</span>
+                <span id="chatHeaderLockBadge" class="chip ok" style="padding: 1px 7px; font-size: 10px">
+                  🔒 مشفرة
+                </span>
+              </div>
+              <div class="status" id="chatHeaderStatus">متصل</div>
+            </div>
+            <button class="icon-btn" id="btnOpenRoomInfo" type="button" aria-label="تفاصيل ودعوة الغرفة">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="6" cy="12" r="2.5" />
+                <circle cx="18" cy="6" r="2.5" />
+                <circle cx="18" cy="18" r="2.5" />
+                <path d="M8.2 10.8 15.8 7.2M8.2 13.2l7.6 3.6" />
+              </svg>
+            </button>
+            <button class="icon-btn" id="btnStartVoiceCall" type="button" aria-label="مكالمة صوتية">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path
+                  d="M5 4h4l2 5-2.5 1.5a12 12 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2Z"
+                />
+              </svg>
+            </button>
+            <button class="icon-btn accent" id="btnStartVideoCall" type="button" aria-label="مكالمة فيديو">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="6" width="12" height="12" rx="2.5" />
+                <path d="M15 10.5l6-3.5v10l-6-3.5" />
+              </svg>
+            </button>
+          </div>
+
+          <div class="msgs" id="chatMessagesContainer"></div>
+
+          <div class="composer">
+            <div class="box">
+              <input
+                id="inpChatMessage"
+                type="text"
+                placeholder="اكتب رسالة…"
+                aria-label="اكتب رسالة"
+                autocomplete="off"
+              />
+            </div>
+            <button class="send-btn" id="btnSendMessage" type="button" aria-label="إرسال">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path
+                  d="M4 11.5 20 4l-4.2 16-3.4-6.8L4 11.5Zm8.4 4.3 2 4 1.7-6.4-3.7 2.4Z"
+                  transform="scale(-1,1) translate(-24,0)"
+                />
+              </svg>
+            </button>
+          </div>
+        </section>
+
+        <!-- ==================== 6. ROOM INFO, INVITE & DEVICE VERIFICATION ==================== -->
+        <section class="screen" id="scr-roominfo">
+          <div class="app-head">
+            <div class="head-row">
+              <button class="icon-btn" id="btnRoomInfoBack" type="button" aria-label="رجوع">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <path d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+              <div class="grow">
+                <h2 style="font-size: 19px" id="riTitle">تفاصيل الغرفة</h2>
+                <p id="riSubtitle">غرفة دائمة</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="sec-label">حالة التشفير</div>
+          <div class="invite-box">
+            <div id="riEncryptionTitle" style="font-size: 13px; font-weight: 600"></div>
+            <div
+              id="riEncryptionDesc"
+              style="font-size: 11.5px; color: var(--app-ink-soft); margin-top: 4px; line-height: 1.6"
+            ></div>
+            <button
+              type="button"
+              class="pill-btn ghost"
+              id="btnReshareRoomKeysNow"
+              style="margin-top: 8px; display: none"
+            >
+              إعادة مشاركة مفتاح Megolm مع جميع أجهزة الغرفة الآن
+            </button>
+          </div>
+
+          <div class="sec-label">دعوة إلى الغرفة</div>
+          <div class="invite-box">
+            <div class="lbl">رابط الدعوة — يفتح الغرفة مباشرة داخل تطبيق Run</div>
+            <div class="invite-row">
+              <span class="val" id="riInviteLink">run://join/RUN</span>
+              <button class="pill-btn" type="button" id="btnCopyRoomLink">نسخ الرابط</button>
+            </div>
+          </div>
+
+          <div class="invite-box">
+            <div class="lbl">كود الغرفة الدائم</div>
+            <div class="invite-row">
+              <span class="val" id="riRoomCode">RUN</span>
+              <button class="pill-btn" type="button" id="btnCopyRoomCode">نسخ الكود</button>
+            </div>
+          </div>
+
+          <div style="padding: 6px 20px">
+            <button class="primary-btn" id="btnShareRoomInvite" type="button" style="height: 44px; font-size: 14px">
+              مشاركة الدعوة
+            </button>
+          </div>
+
+          <div class="sec-label" id="riMembersHeader">الأعضاء</div>
+          <div id="riMembersList"></div>
+
+          <div class="sec-label" id="riDevicesHeader">أجهزة التشفير والتحقق (Olm / Ed25519)</div>
+          <div id="riDevicesList"></div>
+          <div style="height: 24px"></div>
+        </section>
+
+        <!-- ==================== 7. SEARCH & FRIENDS SCREEN ==================== -->
+        <section class="screen" id="scr-search">
+          <div class="app-head">
+            <div class="head-row">
+              <button class="icon-btn" id="btnSearchBack" type="button" aria-label="رجوع">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <path d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+              <div class="grow">
+                <h2>بحث</h2>
+                <p>أصدقاء بالاسم أو <span dir="ltr">@username</span>، وغرف عامة بالاسم أو الكود</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="search-input-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7" />
+              <path d="M20 20l-3.5-3.5" />
+            </svg>
+            <input
+              type="text"
+              id="inpSearchQuery"
+              placeholder="اكتب اسمًا ظاهرًا، @username، أو كود غرفة…"
+              aria-label="بحث عن أصدقاء وغرف"
+            />
+          </div>
+
+          <div class="seg" style="margin: 4px 20px 10px" role="tablist">
+            <button type="button" id="btnSearchTabFriends" class="on">أصدقاء</button>
+            <button type="button" id="btnSearchTabRooms">غرف عامة</button>
+          </div>
+
+          <!-- Friends Search Pane -->
+          <div id="searchPaneFriends">
+            <div class="sec-label">نتائج البحث عن الأصدقاء</div>
+            <div id="searchFriendsResults"></div>
+
+            <div class="sec-label">طلبات صداقة وغرف واردة</div>
+            <div id="searchIncomingInvites"></div>
+
+            <div class="sec-label">طلبات صداقة مُرسلة</div>
+            <div id="searchOutgoingInvites"></div>
+
+            <div class="sec-label">أصدقائي</div>
+            <div id="searchKnownFriends"></div>
+
+            <div class="invite-box">
+              <div class="lbl">رابط دعوتي — يفتح محادثة معي مباشرة داخل Run</div>
+              <div class="invite-row">
+                <span class="val" id="myProfileInviteLink">run://friend/@user</span>
+                <button class="pill-btn" type="button" id="btnCopyMyFriendLink">نسخ</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Public Rooms Search Pane -->
+          <div id="searchPaneRooms" style="display: none">
+            <div class="sec-label">الغرف العامة — بالاسم أو بالكود الدائم</div>
+            <div id="searchPublicRoomsResults"></div>
+          </div>
+          <div style="height: 20px"></div>
+        </section>
+
+        <!-- ==================== 8. CREATE GROUP ROOM SCREEN ==================== -->
+        <section class="screen" id="scr-create">
+          <div class="app-head">
+            <div class="head-row">
+              <button class="icon-btn" id="btnCreateRoomBack" type="button" aria-label="رجوع">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <path d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+              <div class="grow">
+                <h2 style="font-size: 20px">غرفة جماعية جديدة</h2>
+                <p>مشفرة افتراضيًا (Olm/Megolm) مع كود مشاركة دائم</p>
+              </div>
+            </div>
+          </div>
+
+          <div style="padding: 12px 20px 24px">
+            <div class="field">
+              <label for="inpNewRoomName">اسم الغرفة</label>
+              <div class="box">
+                <input id="inpNewRoomName" type="text" placeholder="أدخل اسم الغرفة…" />
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="inpNewRoomTopic">وصف الغرفة <span style="opacity: 0.7">(اختياري)</span></label>
+              <div class="box" style="height: auto; padding: 8px 13px">
+                <textarea
+                  id="inpNewRoomTopic"
+                  rows="2"
+                  placeholder="وصف مختصر للغرفة…"
+                ></textarea>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="inpCreateMemberSearch">
+                إضافة أعضاء — ابحث بالاسم الظاهر أو <span dir="ltr">@username</span>
+              </label>
+              <div class="box">
+                <input id="inpCreateMemberSearch" type="text" placeholder="ابحث لإضافة عضو…" />
+              </div>
+            </div>
+
+            <div id="createRoomPickedChips" style="display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px"></div>
+            <div id="createRoomCandidateMembers"></div>
+
+            <div style="height: 14px"></div>
+            <button class="primary-btn" id="btnConfirmCreateRoom" type="button">إنشاء الغرفة</button>
+          </div>
+        </section>
+
+        <!-- ==================== 9. CALLS HISTORY SCREEN ==================== -->
+        <section class="screen" id="scr-calls">
+          <div class="app-head">
+            <h2>المكالمات</h2>
+            <p id="callsSubtitle">مكالمات صوت وفيديو 1-إلى-1 حقيقية عبر WebRTC</p>
+            <div
+              id="turnStatusBanner"
+              style="margin-top: 6px; font-size: 11.5px; color: var(--accent); line-height: 1.55"
+            ></div>
+          </div>
+          <div class="sec-label">الأخيرة</div>
+          <div id="callsHistoryList"></div>
+        </section>
+
+        <!-- ==================== 10. ACTIVE WEBRTC CALL SCREEN ==================== -->
+        <section class="screen call-screen" id="scr-call">
+          <div class="video-stage">
+            <video id="remoteVideo" autoplay playsinline></video>
+            <video id="localVideo" autoplay playsinline muted></video>
+            <div class="call-overlay-info" id="callOverlayInfo">
+              <span
+                class="avatar"
+                id="activeCallAvatar"
+                style="width: 104px; height: 104px; font-size: 34px; background: #8a6d3b; margin-bottom: 12px"
+                >R</span
+              >
+              <h3 id="activeCallPeerName" style="margin: 0; font-size: 21px">مكالمة Run</h3>
+              <div
+                id="activeCallStatusText"
+                style="font-size: 13px; opacity: 0.82; margin-top: 6px"
+              >
+                جاري الاتصال…
+              </div>
+            </div>
+          </div>
+
+          <!-- Incoming Call Controls -->
+          <div class="call-controls" id="callControlsIncoming" style="display: none">
+            <div class="ctl">
+              <button type="button" class="accept" id="btnAcceptCall" aria-label="قبول المكالمة">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <path
+                    d="M5 4h4l2 5-2.5 1.5a12 12 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2Z"
+                  />
+                </svg>
+              </button>
+              قبول
+            </div>
+            <div class="ctl">
+              <button type="button" class="end" id="btnDeclineCall" aria-label="رفض المكالمة">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+              </button>
+              رفض
+            </div>
+          </div>
+
+          <!-- Active / Outgoing Call Controls -->
+          <div class="call-controls" id="callControlsActive">
+            <div class="ctl">
+              <button type="button" id="btnToggleMic" aria-label="كتم الميكروفون">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="3" width="6" height="11" rx="3" />
+                  <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+                </svg>
+              </button>
+              <span id="lblToggleMic">كتم</span>
+            </div>
+            <div class="ctl">
+              <button type="button" id="btnToggleCam" aria-label="تشغيل أو إيقاف الكاميرا">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="6" width="12" height="12" rx="2.5" />
+                  <path d="M15 10.5l6-3.5v10l-6-3.5" />
+                </svg>
+              </button>
+              <span id="lblToggleCam">كاميرا</span>
+            </div>
+            <div class="ctl">
+              <button type="button" id="btnToggleSpk" aria-label="مكبر الصوت">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M4 10v4h3l5 4V6l-5 4H4Z" />
+                  <path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11" />
+                </svg>
+              </button>
+              <span id="lblToggleSpk">مكبر</span>
+            </div>
+            <div class="ctl">
+              <button type="button" class="end" id="btnEndActiveCall" aria-label="إنهاء المكالمة">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+              </button>
+              إنهاء
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== 11. ACCOUNT & SETTINGS SCREEN ==================== -->
+        <section class="screen" id="scr-settings">
+          <div class="app-head">
+            <h2>الحساب</h2>
+          </div>
+
+          <div class="profile-card">
+            <span
+              class="avatar"
+              id="accountAvatar"
+              style="width: 54px; height: 54px; background: #d95d28; font-size: 18px"
+              >R</span
+            >
+            <div style="flex: 1; min-width: 0">
+              <div id="accountDisplayName" style="font-size: 16.5px; font-weight: 600">مستخدم Run</div>
+              <div
+                id="accountPublicHandle"
+                style="font-size: 13px; color: var(--app-ink-soft); direction: ltr; text-align: right"
+              >
+                @user
+              </div>
+            </div>
+            <span class="chip">Run account</span>
+          </div>
+
+          <div class="sec-label">التشفير (Olm/Megolm) والنسخة الاحتياطية (PIN)</div>
+
+          <div class="invite-box">
+            <div class="lbl" id="accountDeviceIdLabel">بصمة مفتاح التشفير لهذا الجهاز (Ed25519)</div>
+            <div
+              id="accountDeviceFingerprint"
+              style="direction: ltr; text-align: left; font-size: 12px; font-weight: 600; color: var(--accent)"
+            ></div>
+          </div>
+
+          <button class="set-row" type="button" id="btnAccountOpenPinCreate">
+            <span class="ic">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="5" y="11" width="14" height="9" rx="2" />
+                <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+              </svg>
+            </span>
+            <span class="meta">
+              <span class="t">رمز PIN لنسخ مفاتيح Megolm احتياطيًا (6 أرقام)</span>
+              <span class="d" id="accountPinStatusDesc">أنشئ أو حدّث رمز PIN لحفظ نسخة مفاتيح التشفير المشفرة</span>
+            </span>
+          </button>
+
+          <button class="set-row" type="button" id="btnAccountOpenPinRestore">
+            <span class="ic">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="7" y="2.5" width="10" height="19" rx="2.5" />
+                <path d="M11 18.5h2" />
+              </svg>
+            </span>
+            <span class="meta">
+              <span class="t">استعادة المحادثات المشفرة على جهاز جديد</span>
+              <span class="d">أدخل رمز PIN المكون من 6 أرقام لاسترجاع مفاتيح الغرف</span>
+            </span>
+          </button>
+
+          <div class="sec-label">جودة المكالمات وتوفير البيانات</div>
+          <div style="display: flex; gap: 8px; padding: 6px 20px; flex-wrap: wrap">
+            <button type="button" class="pill-btn" data-quality="DEFAULT_480P" id="btnQuality480p">
+              480p قياسي (افتراضي)
+            </button>
+            <button type="button" class="pill-btn ghost" data-quality="DATA_SAVER" id="btnQuality240p">
+              توفير البيانات 240p
+            </button>
+            <button type="button" class="pill-btn ghost" data-quality="AUDIO_ONLY" id="btnQualityAudio">
+              صوت فقط
+            </button>
+          </div>
+
+          <div class="sec-label">المظهر (Design B)</div>
+          <div style="display: flex; gap: 8px; padding: 6px 20px; flex-wrap: wrap">
+            <button type="button" class="pill-btn" id="btnThemeDark">Warm Night (داكن)</button>
+            <button type="button" class="pill-btn ghost" id="btnThemeLight">Warm Paper (فاتح)</button>
+          </div>
+
+          <div class="sec-label">الإشعارات والجلسة</div>
+          <button class="set-row" type="button" id="btnEnableBrowserNotifs">
+            <span class="ic">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+                <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+              </svg>
+            </span>
+            <span class="meta">
+              <span class="t">إشعارات الرسائل في المتصفح</span>
+              <span class="d" id="notifsStatusDesc">اضغط لتفعيل إشعارات الرسائل الجديدة أثناء المزامنة</span>
+            </span>
+          </button>
+
+          <button class="set-row" type="button" id="btnLogout">
+            <span class="ic" style="color: var(--danger)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <polyline points="16 17 21 12 16 7" />
+                <line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+            </span>
+            <span class="meta">
+              <span class="t" style="color: var(--danger)">تسجيل الخروج</span>
+              <span class="d">غرفك وتاريخ محادثاتك محفوظان في Run account الخاص بك عند العودة</span>
+            </span>
+          </button>
+          <div style="height: 24px"></div>
+        </section>
+      </div>
+
+      <!-- ==================== FIXED BOTTOM TABS (Rooms / Calls / Account) ==================== -->
+      <nav class="tabbar hidden" id="bottomTabBar" aria-label="التنقل الرئيسي">
+        <button class="tab active" type="button" data-main-tab="rooms">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12a8 8 0 0 1-8 8H4l2.3-2.9A8 8 0 1 1 21 12Z" />
+          </svg>
+          Rooms
+          <span class="bdg" id="unreadTotalBadge" style="display: none">0</span>
+        </button>
+        <button class="tab" type="button" data-main-tab="calls">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path
+              d="M5 4h4l2 5-2.5 1.5a12 12 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2Z"
+            />
+          </svg>
+          Calls
+        </button>
+        <button class="tab" type="button" data-main-tab="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="8" r="4" />
+            <path d="M4.5 20.5a7.5 7.5 0 0 1 15 0" />
+          </svg>
+          Account
+        </button>
+      </nav>
+    </main>
+
+    <script src="./run-config.js"></script>
+    <script src="./crypto-engine.js"></script>
+    <script src="./matrix-client.js"></script>
+    <script src="./webrtc-call.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
