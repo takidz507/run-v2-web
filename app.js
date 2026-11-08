@@ -1,19 +1,36 @@
 /**
- * Run v2 Web — Main UI Controller & State Loop.
+ * Run v2 Web (v2.3.1) — Main UI Controller & State Loop.
  *
- * Connects all Design B screens to `RunMatrixClient`, `RunCryptoEngine`,
- * and `RunWebRtcManager`. Zero fake or placeholder rooms/contacts.
+ * Fixes implemented in v2.3.1:
+ * 1. Bug 1 Fix (Rooms disappearing on refresh):
+ *    - Loads cached room summaries from `localStorage` immediately on startup and renders them.
+ *    - Tracks `state.initialSyncCompleted` and displays «جاري تحميل الغرف…» until the first
+ *      `/sync` finishes — NEVER displays «لا توجد غرف» before the first sync completes.
+ *    - Displays a visible sync error banner («تعذر المزامنة — إعادة المحاولة…») with a
+ *      working «إعادة المحاولة» button whenever `/sync` fails, instead of retrying silently.
+ *    - Preserves cached room names and last messages across incremental `/sync` deltas and saves
+ *      updated room summaries to `localStorage`.
+ * 2. Bug 2 Fix (Call start error hiding true cause):
+ *    - Separates TURN credential fetch, `getUserMedia`, WebRTC offer creation, and `sendCallInvite`
+ *      into distinct error-handled steps, logs `err.name` + `err.message` to `console`, and displays
+ *      the true cause (permission denial vs missing mic/camera vs network/invite failure vs TURN warning).
+ * 3. Bug 3 Fix (Intermittent join by code `AGEN-9641`):
+ *    - Sanitizes invisible/bidi characters, provides a direct «انضمام الآن» card when typing a code,
+ *      passes both `roomId` and `roomCode` from search results, and resolves aliases across cases.
  */
 (function () {
   var state = {
     currentScreen: "login",
-    authMode: "login", // "login" | "register"
-    theme: "dark", // "dark" (Warm Night) | "light" (Warm Paper)
-    callQuality: "DEFAULT_480P", // "DEFAULT_480P" | "DATA_SAVER" | "AUDIO_ONLY"
+    authMode: "login",
+    theme: "dark",
+    callQuality: "DEFAULT_480P",
     account: null,
-    // Strictly empty by default: zero fake or placeholder data
+    // Strictly empty by default: populated from localStorage cache on login/reload, then updated by /sync
     rooms: [],
-    spaceFilter: "ALL", // "ALL" | "GROUPS" | "DIRECT"
+    initialSyncCompleted: false,
+    isSyncInProgress: false,
+    syncError: null,
+    spaceFilter: "ALL",
     activeRoom: null,
     messagesByRoom: {},
     activeRoomMembers: [],
@@ -30,7 +47,7 @@
     pickedCreateMembers: {},
     createMemberCandidates: [],
     // PIN Screen state
-    pinMode: "create", // "create" | "restore"
+    pinMode: "create",
     pinFirstEntry: "",
     pinCurrentValue: "",
     // Multi-Stage UIAA Registration state
@@ -51,7 +68,7 @@
     turnStatusMessage: "",
     callLogs: [],
     activeCall: {
-      phase: "IDLE", // "IDLE" | "OUTGOING_RINGING" | "INCOMING_RINGING" | "CONNECTING" | "CONNECTED"
+      phase: "IDLE",
       callId: "",
       roomId: "",
       peerName: "",
@@ -66,6 +83,7 @@
   };
 
   var syncLoopActive = false;
+  var syncRetryWakeResolver = null;
   var callTimerInterval = null;
   var searchDebounceTimer = null;
 
@@ -120,7 +138,7 @@
     clearTimeout(toast._hideTimer);
     toast._hideTimer = setTimeout(function () {
       toast.classList.add("hidden");
-    }, 5000);
+    }, 5500);
   }
 
   function showScreen(screenId) {
@@ -294,7 +312,6 @@
       return;
     }
 
-    // Registration mode (inside the web app with full UIAA support)
     btn.disabled = true;
     btn.textContent = "جاري الاتصال بالسيرفر…";
     try {
@@ -548,7 +565,11 @@
 
   async function onAuthenticatedSuccess(account, isNewRegistration) {
     state.account = account;
+    state.initialSyncCompleted = false;
+    state.syncError = null;
+    state.rooms = window.RunMatrixClient.getPersistedRoomsList();
     renderAccountScreen();
+    renderRoomsList();
     checkTurnStatusAfterLogin();
     startSyncLoop();
 
@@ -635,7 +656,6 @@
           updatePinUi(false, "رمز PIN غير صحيح أو لا توجد نسخة احتياطية مطابقة", true);
         }
       } else {
-        // Create mode: 2 steps (enter + confirm)
         if (!state.pinFirstEntry) {
           state.pinFirstEntry = entered;
           state.pinCurrentValue = "";
@@ -666,11 +686,10 @@
   }
 
   // =========================================================================
-  // 3. CONTINUOUS /SYNC LOOP, RE-DECRYPTION ON KEY ARRIVAL & NOTIFICATIONS
+  // 3. CONTINUOUS /SYNC LOOP, LOCALSTORAGE CACHE & VISIBLE SYNC RETRY (Fix 1)
   // =========================================================================
 
   window.RunCryptoEngine.setOnRoomKeyReceived(function (newlyReceivedSessions) {
-    // Re-decrypt any cached messages whose Megolm session key just arrived via Olm!
     var updatedAny = false;
     newlyReceivedSessions.forEach(function (item) {
       var list = state.messagesByRoom[item.roomId];
@@ -697,16 +716,49 @@
     }
   });
 
+  function updateSyncStatusBanner() {
+    var banner = document.getElementById("syncStatusBanner");
+    var textEl = document.getElementById("syncStatusText");
+    if (!banner || !textEl) return;
+
+    if (state.syncError) {
+      banner.style.display = "block";
+      textEl.textContent = "تعذر المزامنة (" + state.syncError + ") — جاري إعادة المحاولة…";
+    } else {
+      banner.style.display = "none";
+      textEl.textContent = "";
+    }
+  }
+
+  function triggerImmediateSyncRetry() {
+    state.syncError = null;
+    updateSyncStatusBanner();
+    renderRoomsList();
+    if (typeof syncRetryWakeResolver === "function") {
+      var resolve = syncRetryWakeResolver;
+      syncRetryWakeResolver = null;
+      resolve();
+    } else if (!syncLoopActive && window.RunMatrixClient.isLoggedIn()) {
+      startSyncLoop();
+    }
+  }
+
   async function startSyncLoop() {
     if (syncLoopActive) return;
     syncLoopActive = true;
     var sinceToken = null;
 
     while (syncLoopActive && window.RunMatrixClient.isLoggedIn()) {
+      state.isSyncInProgress = true;
+      renderRoomsList();
       try {
         var data = await window.RunMatrixClient.sync(sinceToken, sinceToken ? 12000 : 0);
         var isInitialSync = !sinceToken;
         sinceToken = data.nextBatch;
+        state.initialSyncCompleted = true;
+        state.isSyncInProgress = false;
+        state.syncError = null;
+        updateSyncStatusBanner();
 
         // Merge new timeline messages
         var msgRoomIds = Object.keys(data.newMessagesByRoom || {});
@@ -730,17 +782,43 @@
           });
         }
 
-        // Merge room summaries
+        // Merge room summaries preserving cached last message & name across incremental sync batches
         var roomMap = {};
         state.rooms.forEach(function (r) {
           roomMap[r.roomId] = r;
         });
         (data.rooms || []).forEach(function (updatedRoom) {
-          roomMap[updatedRoom.roomId] = updatedRoom;
+          var prev = roomMap[updatedRoom.roomId];
+          if (prev) {
+            var mergedRoom = Object.assign({}, prev, updatedRoom);
+            if (!updatedRoom.lastMessageTimestamp && prev.lastMessageTimestamp) {
+              mergedRoom.lastMessageTimestamp = prev.lastMessageTimestamp;
+              mergedRoom.lastMessageSender = prev.lastMessageSender;
+              mergedRoom.lastMessageBody = prev.lastMessageBody;
+            }
+            if (
+              (!updatedRoom.name || updatedRoom.name === "غرفة Run") &&
+              prev.name &&
+              prev.name !== "غرفة Run"
+            ) {
+              mergedRoom.name = prev.name;
+            }
+            if (prev.isEncrypted && !updatedRoom.isEncrypted) {
+              mergedRoom.isEncrypted = true;
+              mergedRoom.encryptionStatusNote = null;
+            }
+            roomMap[updatedRoom.roomId] = mergedRoom;
+          } else {
+            roomMap[updatedRoom.roomId] = updatedRoom;
+          }
         });
+
         state.rooms = Object.values(roomMap).sort(function (a, b) {
           return (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0);
         });
+
+        // Persist updated room summaries in localStorage immediately (Fix 1.1)
+        window.RunMatrixClient.savePersistedRoomsList(state.rooms);
 
         if (state.activeRoom && roomMap[state.activeRoom.roomId]) {
           state.activeRoom = roomMap[state.activeRoom.roomId];
@@ -759,9 +837,23 @@
         (data.signalingEvents || []).forEach(function (ev) {
           handleSignalingEvent(ev);
         });
-      } catch (_) {
-        await new Promise(function (r) {
-          setTimeout(r, 3500);
+      } catch (syncErr) {
+        console.warn("[RunSync] Sync failed:", syncErr && syncErr.name, syncErr && syncErr.message);
+        state.isSyncInProgress = false;
+        state.syncError = (syncErr && syncErr.message) || "انقطاع في الشبكة";
+        updateSyncStatusBanner();
+        renderRoomsList();
+
+        // Wait 3.5s OR wake immediately when user clicks «إعادة المحاولة»
+        await new Promise(function (resolve) {
+          var timer = setTimeout(function () {
+            syncRetryWakeResolver = null;
+            resolve();
+          }, 3500);
+          syncRetryWakeResolver = function () {
+            clearTimeout(timer);
+            resolve();
+          };
         });
       }
       await new Promise(function (r) {
@@ -777,7 +869,7 @@
     try {
       new Notification(senderName, {
         body: body,
-        icon: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjggMTI4IiB3aWR0aD0iMTI4IiBoZWlnaHQ9IjEyOCI+CiAgPHJlY3Qgd2lkdGg9IjEyOCIgaGVpZ2h0PSIxMjgiIHJ4PSIzMCIgZmlsbD0iIzE3MTMxMCIvPgogIDxyZWN0IHg9IjYiIHk9IjYiIHdpZHRoPSIxMTYiIGhlaWdodD0iMTE2IiByeD0iMjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI0U4QTMzRCIgc3Ryb2tlLW9wYWNpdHk9IjAuMTYiIHN0cm9rZS13aWR0aD0iMiIvPgogIDxwYXRoIGQ9Ik00MCAzMEg2OUM4Mi44IDMwIDkyIDM4LjIgOTIgNTAuNUM5MiA2MC4xIDg2LjEgNjcuMSA3Ni42IDY5LjhMOTIuNCA5NS4yQzkzLjUgOTcgOTIuMiA5OS4yIDkwLjEgOTkuMkg3Ny44Qzc2LjQgOTkuMiA3NS4xIDk4LjUgNzQuNCA5Ny4zTDU5LjggNzIuMkg1My41Vjk2LjVDNTMuNSA5OCA1Mi4zIDk5LjIgNTAuOCA5OS4ySDQwQzM4LjUgOTkuMiAzNy4zIDk4IDM3LjMgOTYuNVYzMi43QzM3LjMgMzEuMiAzOC41IDMwIDQwIDMwWk01My41IDQzLjJWNTkuMkg2Ny40QzczLjYgNTkuMiA3Ny40IDU1LjkgNzcuNCA1MS4xQzc3LjQgNDYuNCA3My42IDQzLjIgNjcuNCA0My4ySDUzLjVaIiBmaWxsPSIjRThBMzNEIi8+CiAgPHBhdGggZD0iTTUzLjUgNTkuMkw2Ni41IDcyLjJINTkuOEw1My41IDY0LjVWNTkuMloiIGZpbGw9IiNDNDgyMjIiLz4KPC9zdmc+Cg=="
+        icon: "./icon-run-v2.svg"
       });
     } catch (_) {}
   }
@@ -799,7 +891,17 @@
       unreadBadge.textContent = String(totalUnread);
     }
 
+    // Fix 1.2: NEVER show «لا توجد غرف» before the first sync has completed!
     if (state.rooms.length === 0) {
+      if (!state.initialSyncCompleted) {
+        container.innerHTML =
+          '<div class="empty-note" style="text-align:center;padding:38px 24px">' +
+          '<div style="font-size:15px;font-weight:600;color:var(--accent);margin-bottom:6px">جاري تحميل الغرف…</div>' +
+          '<div style="font-size:12.5px;color:var(--app-ink-soft)">يتم الآن مزامنة غرفك ومحادثاتك المشفرة من حسابك.</div>' +
+          "</div>";
+        return;
+      }
+
       container.innerHTML =
         '<div class="empty-note" style="text-align:center;padding:36px 24px">' +
         '<div style="font-size:15px;font-weight:600;color:var(--app-ink);margin-bottom:6px">لا توجد غرف أو محادثات بعد</div>' +
@@ -884,6 +986,7 @@
     room.encryptionStatusNote = isEnc
       ? null
       : "غير مشفرة — الرسائل في هذه الغرفة غير مشفرة";
+    window.RunMatrixClient.savePersistedRoomsList(state.rooms);
     updateChatHeader();
 
     try {
@@ -1028,6 +1131,7 @@
       r.lastMessageSender = "أنت";
       r.lastMessageBody = text;
       r.lastMessageTimestamp = sentMsg.timestamp;
+      window.RunMatrixClient.savePersistedRoomsList(state.rooms);
       renderChatMessages();
       renderRoomsList();
     } catch (err) {
@@ -1168,7 +1272,6 @@
         if (target) target.manuallyVerified = nextVerified;
         renderRoomInfoMembersAndDevices();
 
-        // Immediately re-share Megolm room key with this device after verification!
         if (nextVerified && r.isEncrypted) {
           try {
             await window.RunMatrixClient.shareMegolmKeyWithAllRoomDevices(r.roomId, {
@@ -1182,7 +1285,7 @@
   }
 
   // =========================================================================
-  // 5. SEARCH, FRIENDS & CREATE GROUP ROOM
+  // 5. SEARCH, FRIENDS, DIRECT CODE JOIN (Fix 3) & CREATE GROUP ROOM
   // =========================================================================
 
   function setSearchTab(tab) {
@@ -1193,14 +1296,39 @@
     document.getElementById("searchPaneRooms").style.display = tab === "ROOMS" ? "" : "none";
   }
 
+  function updateDirectCodeJoinBox(rawQuery) {
+    var box = document.getElementById("directCodeJoinBox");
+    var valEl = document.getElementById("directCodeJoinValue");
+    if (!box || !valEl) return;
+
+    var trimmed = window.RUN_CONFIG.stripInvisibleAndTrim(rawQuery);
+    var isJoinLink = /^run:\/\/join\//i.test(trimmed) || /^#\/join\//i.test(trimmed);
+    var isRoomCode = window.RUN_CONFIG.looksLikeRoomCode(trimmed) || trimmed.startsWith("#");
+
+    if (isJoinLink || isRoomCode) {
+      var cleanCode = window.RUN_CONFIG.cleanRoomCodeOrIdInput(trimmed);
+      box.style.display = "block";
+      valEl.textContent = cleanCode.toUpperCase();
+    } else {
+      box.style.display = "none";
+    }
+  }
+
   async function runSearch(query) {
-    var clean = String(query || "").trim();
+    var clean = window.RUN_CONFIG.stripInvisibleAndTrim(query);
+    updateDirectCodeJoinBox(clean);
+
     if (/^run:\/\/join\//i.test(clean)) {
-      var code = clean.replace(/^run:\/\/join\//i, "").trim();
+      var code = window.RUN_CONFIG.cleanRoomCodeOrIdInput(clean);
       if (code) {
-        await joinRoomAndOpen(code);
+        await joinRoomAndOpen(code, code);
         return;
       }
+    }
+
+    // If the user typed a room code pattern (e.g. AGEN-9641), automatically switch to ROOMS tab so results are immediately visible
+    if (window.RUN_CONFIG.looksLikeRoomCode(clean) && state.searchTab !== "ROOMS") {
+      setSearchTab("ROOMS");
     }
 
     var knownFriendsSet = new Set(
@@ -1340,7 +1468,7 @@
         .join("");
     }
 
-    // 4. Friends list (clicking opens 1-to-1 chat)
+    // 4. Friends list
     if (state.friends.length === 0) {
       knownFriendsEl.innerHTML = '<div class="empty-note">لا يوجد أصدقاء مضافون بعد.</div>';
     } else {
@@ -1371,7 +1499,7 @@
         .join("");
     }
 
-    // 5. Public Rooms results
+    // 5. Public Rooms results (passes both roomId and roomCode for resilient first-try join!)
     if (state.publicRoomResults.length === 0) {
       pubRoomsEl.innerHTML = '<div class="empty-note">لا توجد غرف عامة مطابقة.</div>';
     } else {
@@ -1380,9 +1508,17 @@
           var btnHtml = r.isJoined
             ? '<button type="button" class="pill-btn ghost" data-join-room="' +
               escapeHtml(r.roomId) +
+              '" data-join-code="' +
+              escapeHtml(r.roomCode) +
+              '" data-join-name="' +
+              escapeHtml(r.name) +
               '">فتح</button>'
             : '<button type="button" class="pill-btn" data-join-room="' +
               escapeHtml(r.roomId) +
+              '" data-join-code="' +
+              escapeHtml(r.roomCode) +
+              '" data-join-name="' +
+              escapeHtml(r.name) +
               '">انضمام</button>';
           return (
             '<div class="result-row">' +
@@ -1436,7 +1572,7 @@
     var accBtns = document.querySelectorAll("[data-accept-room]");
     for (var c = 0; c < accBtns.length; c++) {
       accBtns[c].addEventListener("click", function () {
-        joinRoomAndOpen(this.getAttribute("data-accept-room"));
+        joinRoomAndOpen(this.getAttribute("data-accept-room"), "");
       });
     }
 
@@ -1457,7 +1593,10 @@
     var joinBtns = document.querySelectorAll("[data-join-room]");
     for (var j = 0; j < joinBtns.length; j++) {
       joinBtns[j].addEventListener("click", function () {
-        joinRoomAndOpen(this.getAttribute("data-join-room"));
+        var roomIdAttr = this.getAttribute("data-join-room");
+        var roomCodeAttr = this.getAttribute("data-join-code");
+        var roomNameAttr = this.getAttribute("data-join-name");
+        joinRoomAndOpen(roomIdAttr, roomCodeAttr, roomNameAttr);
       });
     }
   }
@@ -1496,6 +1635,7 @@
         peerPresence: "online"
       };
       state.rooms.unshift(summary);
+      window.RunMatrixClient.savePersistedRoomsList(state.rooms);
       renderRoomsList();
       openRoomChat(summary);
     } catch (err) {
@@ -1503,20 +1643,30 @@
     }
   }
 
-  async function joinRoomAndOpen(codeOrRoomId) {
+  async function joinRoomAndOpen(codeOrRoomId, optionalFallbackCode, optionalKnownName) {
     try {
-      var joinedRoomId = await window.RunMatrixClient.joinRoomByCodeOrId(codeOrRoomId);
+      var joinedRoomId = await window.RunMatrixClient.joinRoomByCodeOrId(
+        codeOrRoomId,
+        optionalFallbackCode
+      );
       var existing = state.rooms.find(function (r) {
         return r.roomId === joinedRoomId;
       });
-      var cleanCode = window.RUN_CONFIG.toPublicRoomCode(codeOrRoomId);
+      var resolvedCode =
+        window.RunMatrixClient.getCachedRoomCode(joinedRoomId) ||
+        window.RUN_CONFIG.toPublicRoomCode(optionalFallbackCode || codeOrRoomId);
+      var resolvedName =
+        optionalKnownName ||
+        window.RunMatrixClient.getCachedRoomName(joinedRoomId) ||
+        resolvedCode ||
+        "غرفة Run";
       var isEnc = window.RunMatrixClient.isRoomCurrentlyEncrypted(joinedRoomId);
       var summary =
         existing || {
           roomId: joinedRoomId,
-          name: cleanCode || "غرفة Run",
+          name: resolvedName,
           topic: "",
-          roomCode: cleanCode,
+          roomCode: resolvedCode,
           isDirect: false,
           directPeerUserId: null,
           memberCount: 2,
@@ -1531,10 +1681,12 @@
         };
       if (!existing) {
         state.rooms.unshift(summary);
+        window.RunMatrixClient.savePersistedRoomsList(state.rooms);
         renderRoomsList();
       }
       openRoomChat(summary);
     } catch (err) {
+      console.error("[RunJoin] joinRoomAndOpen failed:", err && err.name, err && err.message);
       showToast(err.message || "تعذر الانضمام إلى الغرفة", true);
     }
   }
@@ -1637,6 +1789,7 @@
       state.pickedCreateMembers = {};
       state.rooms.unshift(newRoom);
       state.activeRoom = newRoom;
+      window.RunMatrixClient.savePersistedRoomsList(state.rooms);
       renderRoomsList();
       showToast("تم إنشاء الغرفة بنجاح · الكود " + newRoom.roomCode, false);
       openRoomInfoScreen();
@@ -1649,7 +1802,7 @@
   }
 
   // =========================================================================
-  // 6. WEBRTC 1-TO-1 VIDEO & VOICE CALLS + TURN CHECK
+  // 6. WEBRTC 1-TO-1 VIDEO & VOICE CALLS + SEPARATE ERROR HANDLING (Fix 2)
   // =========================================================================
 
   window.RunWebRtcManager.configureCallbacks({
@@ -1682,7 +1835,8 @@
         state.turnStatusMessage =
           "تنبيه صادق: السيرفر لا يوفر بيانات TURN عبر /v3/voip/turnServer حاليًا (تعتمد المكالمات على اتصال STUN المباشر)";
       }
-    } catch (_) {
+    } catch (err) {
+      console.warn("[RunCall/TURNCheck]", err && err.name, err && err.message);
       state.turnStatusMessage =
         "تنبيه صادق: السيرفر لم يُرجع بيانات TURN عبر /v3/voip/turnServer (تعتمد المكالمات على اتصال STUN المباشر)";
     }
@@ -1714,20 +1868,61 @@
     updateActiveCallUi();
     showScreen("call");
 
+    // Step 1: Fetch TURN credentials (non-blocking if TURN fails; warn and continue with P2P)
+    var turnCreds = null;
     try {
-      var turnCreds = await window.RunMatrixClient.fetchTurnCredentials().catch(function () {
-        return null;
-      });
-      var offerSdp = await window.RunWebRtcManager.startOutgoingCall({
+      turnCreds = await window.RunMatrixClient.fetchTurnCredentials();
+    } catch (turnErr) {
+      console.warn("[RunCall/TURN] Failed to fetch TURN credentials:", turnErr && turnErr.name, turnErr && turnErr.message);
+      if (turnErr && turnErr.isNetworkError) {
+        console.error("[RunCall/Network] Cannot start call while offline:", turnErr.name, turnErr.message);
+        showToast("تعذر إرسال دعوة المكالمة — تحقق من الاتصال بالإنترنت", true);
+        endActiveCall(false);
+        return;
+      }
+      showToast("تنبيه: تعذر جلب بيانات TURN — جاري المتابعة باتصال مباشر P2P", false);
+    }
+
+    // Step 2: Acquire local microphone/camera & create WebRTC SDP offer
+    var offerSdp = null;
+    try {
+      offerSdp = await window.RunWebRtcManager.startOutgoingCall({
         turnCredentials: turnCreds,
         qualityMode: state.callQuality,
         requestedVideo: effectiveVideo,
         localVideoEl: document.getElementById("localVideo"),
         remoteVideoEl: document.getElementById("remoteVideo")
       });
+    } catch (mediaOrRtcErr) {
+      console.error(
+        "[RunCall/MediaOrWebRTC] Failed to initialize local media or SDP offer:",
+        (mediaOrRtcErr && (mediaOrRtcErr.causeName || mediaOrRtcErr.name)) || "Error",
+        mediaOrRtcErr && (mediaOrRtcErr.causeMessage || mediaOrRtcErr.message)
+      );
+      showToast(
+        (mediaOrRtcErr && mediaOrRtcErr.message) ||
+          "تعذر تجهيز الوسائط للمكالمة",
+        true
+      );
+      endActiveCall(false);
+      return;
+    }
+
+    // Step 3: Send `m.call.invite` signaling event to the room
+    try {
       await window.RunMatrixClient.sendCallInvite(r.roomId, callId, offerSdp);
-    } catch (err) {
-      showToast("تعذر بدء المكالمة (تأكد من صلاحية الكاميرا والميكروفون في المتصفح)", true);
+    } catch (inviteErr) {
+      console.error(
+        "[RunCall/SendInvite] Failed to send m.call.invite:",
+        inviteErr && inviteErr.name,
+        inviteErr && inviteErr.message
+      );
+      showToast(
+        "تعذر إرسال دعوة المكالمة — تحقق من الاتصال (" +
+          ((inviteErr && inviteErr.message) || "خطأ في الشبكة") +
+          ")",
+        true
+      );
       endActiveCall(false);
     }
   }
@@ -1741,11 +1936,16 @@
     c.isCameraEnabled = effectiveVideo;
     updateActiveCallUi();
 
+    var turnCreds = null;
     try {
-      var turnCreds = await window.RunMatrixClient.fetchTurnCredentials().catch(function () {
-        return null;
-      });
-      var answerSdp = await window.RunWebRtcManager.answerIncomingCall({
+      turnCreds = await window.RunMatrixClient.fetchTurnCredentials();
+    } catch (turnErr) {
+      console.warn("[RunCall/TURN] Answer TURN fetch warning:", turnErr && turnErr.name, turnErr && turnErr.message);
+    }
+
+    var answerSdp = null;
+    try {
+      answerSdp = await window.RunWebRtcManager.answerIncomingCall({
         offerSdp: c.remoteOfferSdp,
         turnCredentials: turnCreds,
         qualityMode: state.callQuality,
@@ -1753,9 +1953,34 @@
         localVideoEl: document.getElementById("localVideo"),
         remoteVideoEl: document.getElementById("remoteVideo")
       });
+    } catch (mediaOrRtcErr) {
+      console.error(
+        "[RunCall/AnswerMedia] Failed to answer call:",
+        (mediaOrRtcErr && (mediaOrRtcErr.causeName || mediaOrRtcErr.name)) || "Error",
+        mediaOrRtcErr && (mediaOrRtcErr.causeMessage || mediaOrRtcErr.message)
+      );
+      showToast(
+        (mediaOrRtcErr && mediaOrRtcErr.message) || "تعذر تشغيل الميكروفون/الكاميرا للرد على المكالمة",
+        true
+      );
+      endActiveCall(true);
+      return;
+    }
+
+    try {
       await window.RunMatrixClient.sendCallAnswer(c.roomId, c.callId, answerSdp);
-    } catch (_) {
-      showToast("تعذر قبول المكالمة", true);
+    } catch (ansErr) {
+      console.error(
+        "[RunCall/SendAnswer] Failed to send m.call.answer:",
+        ansErr && ansErr.name,
+        ansErr && ansErr.message
+      );
+      showToast(
+        "تعذر إرسال رد المكالمة — تحقق من الاتصال (" +
+          ((ansErr && ansErr.message) || "خطأ في الشبكة") +
+          ")",
+        true
+      );
       endActiveCall(true);
     }
   }
@@ -1996,7 +2221,7 @@
     }
 
     if (joinCode) {
-      joinRoomAndOpen(joinCode);
+      joinRoomAndOpen(joinCode, joinCode);
     } else if (friendHandle) {
       openOrStartDirectChat(friendHandle, friendHandle.replace(/^@/, ""));
     }
@@ -2010,6 +2235,11 @@
     document.getElementById("btnCloseToast").addEventListener("click", function () {
       document.getElementById("statusToast").classList.add("hidden");
     });
+
+    // Sync Retry Button (Fix 1.3)
+    document
+      .getElementById("btnRetrySyncNow")
+      .addEventListener("click", triggerImmediateSyncRetry);
 
     // Auth & UIAA Registration
     document.getElementById("tabModeLogin").addEventListener("click", function () {
@@ -2152,7 +2382,7 @@
         }
       });
 
-    // Search Screen
+    // Search Screen & Direct Code Join (Fix 3)
     document.getElementById("btnSearchBack").addEventListener("click", function () {
       showScreen("rooms");
     });
@@ -2164,10 +2394,41 @@
     });
     document.getElementById("inpSearchQuery").addEventListener("input", function () {
       var q = this.value;
+      updateDirectCodeJoinBox(q);
       clearTimeout(searchDebounceTimer);
       searchDebounceTimer = setTimeout(function () {
         runSearch(q);
-      }, 280);
+      }, 240);
+    });
+    document.getElementById("inpSearchQuery").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        var val = window.RUN_CONFIG.stripInvisibleAndTrim(this.value);
+        if (
+          /^run:\/\/join\//i.test(val) ||
+          window.RUN_CONFIG.looksLikeRoomCode(val) ||
+          val.startsWith("#")
+        ) {
+          var code = window.RUN_CONFIG.cleanRoomCodeOrIdInput(val);
+          if (code) {
+            joinRoomAndOpen(code, code);
+          }
+        }
+      }
+    });
+    document.getElementById("btnDirectCodeJoin").addEventListener("click", async function () {
+      var code = window.RUN_CONFIG.cleanRoomCodeOrIdInput(
+        document.getElementById("inpSearchQuery").value
+      );
+      if (!code) return;
+      this.disabled = true;
+      var origText = this.textContent;
+      this.textContent = "جاري الانضمام…";
+      try {
+        await joinRoomAndOpen(code, code);
+      } finally {
+        this.disabled = false;
+        this.textContent = origText;
+      }
     });
     document.getElementById("btnCopyMyFriendLink").addEventListener("click", function () {
       copyToClipboard(document.getElementById("myProfileInviteLink").textContent, this);
@@ -2272,19 +2533,32 @@
       await window.RunMatrixClient.logout();
       state.account = null;
       state.rooms = [];
+      state.initialSyncCompleted = false;
+      state.syncError = null;
       state.messagesByRoom = {};
+      updateSyncStatusBanner();
       showScreen("login");
     });
   }
 
   // =========================================================================
-  // BOOTSTRAP ON PAGE LOAD
+  // BOOTSTRAP ON PAGE LOAD (Fix 1: Restore cached rooms immediately!)
   // =========================================================================
 
   window.addEventListener("DOMContentLoaded", async function () {
     loadPreferences();
     bindAllEvents();
-    renderRoomsList();
+
+    // If a session already exists in localStorage, immediately restore cached rooms
+    // BEFORE waiting for WASM or network `/sync` so the user never sees a blank/empty list!
+    if (window.RunMatrixClient.isLoggedIn()) {
+      state.initialSyncCompleted = false;
+      state.rooms = window.RunMatrixClient.getPersistedRoomsList();
+      showScreen("rooms");
+      renderRoomsList();
+    } else {
+      renderRoomsList();
+    }
     renderCallsHistory();
 
     try {
@@ -2292,12 +2566,18 @@
       var restoredAccount = await window.RunMatrixClient.restoreExistingSessionIfAny();
       if (restoredAccount) {
         state.account = restoredAccount;
+        if (state.rooms.length === 0) {
+          state.rooms = window.RunMatrixClient.getPersistedRoomsList();
+        }
         renderAccountScreen();
         showScreen("rooms");
+        renderRoomsList();
         checkTurnStatusAfterLogin();
         startSyncLoop();
         handleUrlDeepLinkIfAny();
       }
-    } catch (_) {}
+    } catch (initErr) {
+      console.error("[RunBootstrap] Init error:", initErr && initErr.name, initErr && initErr.message);
+    }
   });
 })();

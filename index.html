@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#171310" />
-    <title>Run v2</title>
+    <title>Run v2 (2.3.1)</title>
     <link rel="icon" type="image/svg+xml" href="./icon-run-v2.svg" />
     <link rel="manifest" href="./manifest.json" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -45,7 +45,7 @@
               <div>
                 <h2 id="authHeading">مرحبًا بعودتك إلى Run</h2>
                 <div style="font-size: 12px; color: var(--app-ink-soft)">
-                  حساب واحد لغرفك ومحادثاتك الدائمة المشفرة
+                  حساب واحد لغرفك ومحادثاتك الدائمة المشفرة · الإصدار 2.3.1
                 </div>
               </div>
             </div>
@@ -276,6 +276,23 @@
             </div>
           </div>
 
+          <!-- Sync Error / Retry Banner (Fix 1.3) -->
+          <div
+            id="syncStatusBanner"
+            class="invite-box"
+            style="display: none; margin: 4px 20px 8px; border-color: var(--danger); padding: 10px 13px"
+          >
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px">
+              <span
+                id="syncStatusText"
+                style="font-size: 12px; color: var(--danger); line-height: 1.5"
+              >
+                تعذر المزامنة — إعادة المحاولة…
+              </span>
+              <button type="button" class="pill-btn" id="btnRetrySyncNow">إعادة المحاولة</button>
+            </div>
+          </div>
+
           <button
             class="search-bar-btn"
             id="btnOpenSearchFromRooms"
@@ -471,9 +488,18 @@
             <input
               type="text"
               id="inpSearchQuery"
-              placeholder="اكتب اسمًا ظاهرًا، @username، أو كود غرفة…"
+              placeholder="اكتب اسمًا ظاهرًا، @username، أو كود غرفة (مثل AGEN-9641)…"
               aria-label="بحث عن أصدقاء وغرف"
             />
+          </div>
+
+          <!-- Direct Room Code / Invite Link Quick-Join Card (Fix 3) -->
+          <div class="invite-box" id="directCodeJoinBox" style="display: none; margin: 4px 20px 8px">
+            <div class="lbl">انضمام مباشر بالكود أو الرابط</div>
+            <div class="invite-row">
+              <span class="val" id="directCodeJoinValue">AGEN-9641</span>
+              <button class="pill-btn" type="button" id="btnDirectCodeJoin">انضمام الآن</button>
+            </div>
           </div>
 
           <div class="seg" style="margin: 4px 20px 10px" role="tablist">

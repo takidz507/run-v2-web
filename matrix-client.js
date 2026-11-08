@@ -1,12 +1,22 @@
 /**
- * Run v2 Web — Real Matrix Client-Server v3 API Layer.
+ * Run v2 Web (v2.3.1) — Real Matrix Client-Server v3 API Layer.
  *
  * Connects to `window.RUN_CONFIG.HOMESERVER_BASE_URL` (`https://matrix.unredacted.org`)
  * and integrates with `window.RunCryptoEngine` for full Olm/Megolm E2EE interoperability
  * with Element and Cinny.
+ *
+ * Fixes in v2.3.1:
+ * - Persists room metadata caches (`roomNameCache`, `roomAliasCache`, `roomEncryptedCache`, etc.)
+ *   and cached room summaries in `localStorage` so rooms appear immediately on page reload
+ *   and never lose metadata across incremental `/sync` batches.
+ * - Multi-strategy room join (`joinRoomByCodeOrId`) and search (`searchPublicRooms`) that resolve
+ *   room codes (`AGEN-9641`, `#agen-9641:unredacted.org`, `run://join/AGEN-9641`, or `!roomId`)
+ *   reliably on the first attempt from every entry point (Search results button, code input, or pasted link).
  */
 window.RunMatrixClient = (function () {
   var SESSION_STORAGE_KEY = "run_v2_web_session_v2";
+  var ROOMS_CACHE_PREFIX = "run_v2_web_rooms_cache_";
+  var META_CACHE_PREFIX = "run_v2_web_room_meta_";
 
   var roomNameCache = {};
   var roomTopicCache = {};
@@ -36,6 +46,13 @@ window.RunMatrixClient = (function () {
   }
 
   function clearStoredSession() {
+    var s = getStoredSession();
+    if (s && s.userId) {
+      try {
+        localStorage.removeItem(ROOMS_CACHE_PREFIX + s.userId);
+        localStorage.removeItem(META_CACHE_PREFIX + s.userId);
+      } catch (_) {}
+    }
     try {
       localStorage.removeItem(SESSION_STORAGE_KEY);
     } catch (_) {}
@@ -44,6 +61,82 @@ window.RunMatrixClient = (function () {
   function isLoggedIn() {
     var s = getStoredSession();
     return Boolean(s && s.accessToken && s.userId && s.deviceId);
+  }
+
+  // =========================================================================
+  // PERSISTENT ROOM SUMMARIES & METADATA CACHE (Fixes Bug 1)
+  // =========================================================================
+
+  function loadPersistedRoomMetadata(userId) {
+    if (!userId) return;
+    try {
+      var raw = localStorage.getItem(META_CACHE_PREFIX + userId);
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      roomNameCache = parsed.roomNameCache || {};
+      roomTopicCache = parsed.roomTopicCache || {};
+      roomAliasCache = parsed.roomAliasCache || {};
+      roomEncryptedCache = parsed.roomEncryptedCache || {};
+      roomMemberCountCache = parsed.roomMemberCountCache || {};
+      directPeerCache = parsed.directPeerCache || {};
+      userDisplayNameCache = parsed.userDisplayNameCache || {};
+    } catch (_) {}
+  }
+
+  function savePersistedRoomMetadata(userId) {
+    if (!userId) return;
+    try {
+      var data = {
+        roomNameCache: roomNameCache,
+        roomTopicCache: roomTopicCache,
+        roomAliasCache: roomAliasCache,
+        roomEncryptedCache: roomEncryptedCache,
+        roomMemberCountCache: roomMemberCountCache,
+        directPeerCache: directPeerCache,
+        userDisplayNameCache: userDisplayNameCache
+      };
+      localStorage.setItem(META_CACHE_PREFIX + userId, JSON.stringify(data));
+    } catch (_) {}
+  }
+
+  function getPersistedRoomsList() {
+    var s = getStoredSession();
+    if (!s || !s.userId) return [];
+    try {
+      var raw = localStorage.getItem(ROOMS_CACHE_PREFIX + s.userId);
+      if (!raw) return [];
+      var list = JSON.parse(raw);
+      return Array.isArray(list) ? list : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function savePersistedRoomsList(roomsList) {
+    var s = getStoredSession();
+    if (!s || !s.userId || !Array.isArray(roomsList)) return;
+    try {
+      var compact = roomsList.map(function (r) {
+        return {
+          roomId: r.roomId,
+          name: r.name,
+          topic: r.topic || "",
+          roomCode: r.roomCode || "",
+          isDirect: Boolean(r.isDirect),
+          directPeerUserId: r.directPeerUserId || null,
+          memberCount: r.memberCount || 1,
+          lastMessageSender: r.lastMessageSender || null,
+          lastMessageBody: r.lastMessageBody || "",
+          lastMessageTimestamp: r.lastMessageTimestamp || 0,
+          unreadCount: r.unreadCount || 0,
+          isEncrypted: Boolean(r.isEncrypted),
+          encryptionStatusNote: r.encryptionStatusNote || null,
+          avatarColor: r.avatarColor || window.RUN_CONFIG.avatarColorFor(r.roomId),
+          peerPresence: r.peerPresence || "offline"
+        };
+      });
+      localStorage.setItem(ROOMS_CACHE_PREFIX + s.userId, JSON.stringify(compact));
+    } catch (_) {}
   }
 
   /**
@@ -148,11 +241,23 @@ window.RunMatrixClient = (function () {
       headers["Authorization"] = "Bearer " + session.accessToken;
     }
 
-    var resp = await fetch(window.RUN_CONFIG.HOMESERVER_BASE_URL + pathAndQuery, {
-      method: method,
-      headers: headers,
-      body: bodyObj !== undefined && bodyObj !== null ? JSON.stringify(bodyObj) : undefined
-    });
+    var resp;
+    try {
+      resp = await fetch(window.RUN_CONFIG.HOMESERVER_BASE_URL + pathAndQuery, {
+        method: method,
+        headers: headers,
+        body: bodyObj !== undefined && bodyObj !== null ? JSON.stringify(bodyObj) : undefined
+      });
+    } catch (netErr) {
+      var wrappedNet = new Error(
+        "تعذر الاتصال بالسيرفر — تحقق من اتصال الإنترنت (" +
+          ((netErr && netErr.message) || "NetworkError") +
+          ")"
+      );
+      wrappedNet.isNetworkError = true;
+      wrappedNet.causeName = (netErr && netErr.name) || "TypeError";
+      throw wrappedNet;
+    }
 
     var rawText = await resp.text();
     if (!resp.ok) {
@@ -190,11 +295,6 @@ window.RunMatrixClient = (function () {
     return finalizeAuthenticatedSession(resp, localpart);
   }
 
-  /**
-   * Starts or continues in-app registration on `https://matrix.unredacted.org`.
-   * Handles 200 OK completion, 401 multi-stage UIAA challenges (`m.login.recaptcha`,
-   * `m.login.email.identity`, `m.login.terms`, `m.login.dummy`), and 403 errors honestly.
-   */
   async function registerStep(options) {
     var localpart = window.RUN_CONFIG.toLocalpart(options.username);
     var passwordPlain = options.password || "";
@@ -248,7 +348,6 @@ window.RunMatrixClient = (function () {
     }
 
     if (resp.status === 401 && Array.isArray(json.flows)) {
-      // Check if server only requires m.login.dummy and we haven't sent it yet
       var completed = Array.isArray(json.completed) ? json.completed : [];
       var chosenFlow = selectBestUiaaFlow(json.flows);
       var remainingStages = chosenFlow.filter(function (st) {
@@ -289,7 +388,6 @@ window.RunMatrixClient = (function () {
 
   function selectBestUiaaFlow(flows) {
     if (!Array.isArray(flows) || flows.length === 0) return [];
-    // Prefer flow with recaptcha + email.identity, or standard stages
     for (var i = 0; i < flows.length; i++) {
       var stages = flows[i].stages || [];
       if (
@@ -302,9 +400,6 @@ window.RunMatrixClient = (function () {
     return flows[0].stages || [];
   }
 
-  /**
-   * Requests an email verification token from the homeserver for UIAA `m.login.email.identity`.
-   */
   async function requestRegisterEmailToken(email, clientSecret, sendAttempt) {
     var cleanEmail = String(email || "").trim();
     if (!cleanEmail || cleanEmail.indexOf("@") === -1) {
@@ -323,9 +418,6 @@ window.RunMatrixClient = (function () {
     };
   }
 
-  /**
-   * Submits a numeric/hex verification code directly if the user received a token code in their email.
-   */
   async function submitRegisterEmailCode(sid, clientSecret, tokenCode, submitUrl) {
     var cleanToken = String(tokenCode || "").trim();
     if (!cleanToken) return false;
@@ -364,6 +456,7 @@ window.RunMatrixClient = (function () {
       displayName: fallbackDisplayName || localpart
     });
 
+    loadPersistedRoomMetadata(userId);
     await window.RunCryptoEngine.initAccount(userId, deviceId);
     try {
       await ensureOlmKeysUploaded(0, true);
@@ -386,6 +479,7 @@ window.RunMatrixClient = (function () {
   async function restoreExistingSessionIfAny() {
     var s = getStoredSession();
     if (!s || !s.accessToken || !s.userId || !s.deviceId) return null;
+    loadPersistedRoomMetadata(s.userId);
     await window.RunCryptoEngine.initAccount(s.userId, s.deviceId);
     ensureOlmKeysUploaded(0, false).catch(function () {});
     return getCurrentAccountObject();
@@ -484,10 +578,6 @@ window.RunMatrixClient = (function () {
     }
   }
 
-  /**
-   * Shares the room's active Megolm session key (`m.room_key`) via Olm (`m.room.encrypted`)
-   * with ALL devices of ALL room members (`join` and `invite`), including unverified devices!
-   */
   async function shareMegolmKeyWithAllRoomDevices(roomId, options) {
     var s = getStoredSession();
     if (!s) return;
@@ -504,7 +594,6 @@ window.RunMatrixClient = (function () {
     var memberIds = await getOrFetchRoomMemberUserIds(roomId);
     if (memberIds.length === 0) return;
 
-    // Always query latest device list for members so newly logged-in Element/Cinny devices are included
     try {
       await queryDevicesForUsers(memberIds);
     } catch (_) {}
@@ -546,10 +635,6 @@ window.RunMatrixClient = (function () {
     }
   }
 
-  /**
-   * Answers incoming `m.room_key_request` events from Element, Cinny, or Run
-   * by sending `m.forwarded_room_key` (and `m.room_key` if active) over Olm to the requesting device.
-   */
   async function answerIncomingRoomKeyRequests(requests) {
     if (!Array.isArray(requests) || requests.length === 0) return;
     var s = getStoredSession();
@@ -559,7 +644,6 @@ window.RunMatrixClient = (function () {
       var req = requests[i];
       if (!req || !req.requesterUserId || !req.requestingDeviceId || !req.sessionId) continue;
 
-      // Verify requester is in the room (or is ourselves)
       var roomId = req.roomId || "";
       if (roomId && req.requesterUserId !== s.userId) {
         var memberIds = await getOrFetchRoomMemberUserIds(roomId);
@@ -601,10 +685,6 @@ window.RunMatrixClient = (function () {
     }
   }
 
-  /**
-   * Sends an outgoing `m.room_key_request` when Run Web encounters an encrypted message
-   * whose Megolm session key has not yet been received.
-   */
   async function requestMissingRoomKey(roomId, sessionId, senderKey, senderUserId) {
     if (!roomId || !sessionId) return;
     var cacheKey = roomId + "|" + sessionId;
@@ -704,7 +784,7 @@ window.RunMatrixClient = (function () {
     var root = await apiRequest("GET", query);
     var nextBatch = root.next_batch || sinceToken || "";
 
-    // 1. Process incoming to_device events FIRST (Olm m.room_key, m.forwarded_room_key, m.room_key_request)
+    // 1. Process incoming to_device events FIRST
     var toDeviceEvents = (root.to_device && root.to_device.events) || [];
     var incomingKeyRequests = window.RunCryptoEngine.processIncomingToDeviceEvents(toDeviceEvents);
     if (incomingKeyRequests.length > 0) {
@@ -716,7 +796,7 @@ window.RunMatrixClient = (function () {
     var signedCurveCount = otkCounts.signed_curve25519 || 0;
     ensureOlmKeysUploaded(signedCurveCount, false).catch(function () {});
 
-    // 3. Process device_lists.changed and re-share Megolm keys with updated devices
+    // 3. Process device_lists.changed
     var changedUsers = (root.device_lists && root.device_lists.changed) || [];
     if (changedUsers.length > 0) {
       queryDevicesForUsers(changedUsers)
@@ -806,8 +886,13 @@ window.RunMatrixClient = (function () {
           roomNameCache[roomId] = content.name;
         } else if (type === "m.room.topic" && content.topic) {
           roomTopicCache[roomId] = content.topic;
-        } else if (type === "m.room.canonical_alias" && content.alias) {
-          roomAliasCache[roomId] = content.alias;
+        } else if (type === "m.room.canonical_alias") {
+          var alias = content.alias || (Array.isArray(content.alt_aliases) && content.alt_aliases[0]) || "";
+          if (alias) roomAliasCache[roomId] = alias;
+        } else if (type === "m.room.aliases" && Array.isArray(content.aliases) && content.aliases[0]) {
+          if (!roomAliasCache[roomId]) {
+            roomAliasCache[roomId] = content.aliases[0];
+          }
         } else if (type === "m.room.encryption") {
           if (content.algorithm === window.RUN_CONFIG.MEGOLM_ALGORITHM) {
             roomEncryptedCache[roomId] = true;
@@ -861,7 +946,6 @@ window.RunMatrixClient = (function () {
         if (!ev) continue;
         if (ev.state_key !== undefined) {
           processStateEvent(ev);
-          // If a member joined an encrypted room in the live timeline, immediately share the room key!
           if (
             ev.type === "m.room.member" &&
             ev.content &&
@@ -1040,6 +1124,9 @@ window.RunMatrixClient = (function () {
       });
     }
 
+    // Save updated room metadata caches in localStorage
+    savePersistedRoomMetadata(myUserId);
+
     // 6. Parse Incoming Invites
     var incomingInvites = [];
     var inviteRoomIds = Object.keys(inviteObj);
@@ -1094,7 +1181,7 @@ window.RunMatrixClient = (function () {
   }
 
   // =========================================================================
-  // 5. ROOMS, MESSAGES, CREATION & INVITES
+  // 5. ROOMS, MESSAGES, CREATION & MULTI-STRATEGY JOIN BY CODE (Fixes Bug 3)
   // =========================================================================
 
   async function checkRoomEncryptionEnabled(roomId) {
@@ -1185,13 +1272,6 @@ window.RunMatrixClient = (function () {
     return list;
   }
 
-  /**
-   * Sends a message in `roomId`.
-   * - If the room is encrypted (`m.room.encryption`), shares the Megolm session key
-   *   with ALL devices of ALL room members (`join` and `invite`), encrypts via Megolm,
-   *   and sends `m.room.encrypted`.
-   * - If the room is NOT encrypted, sends `m.room.message` with `isEncrypted: false`.
-   */
   async function sendRoomMessage(roomId, text) {
     var s = getStoredSession();
     if (!s) throw new Error("غير مسجل الدخول");
@@ -1249,10 +1329,6 @@ window.RunMatrixClient = (function () {
     }
   }
 
-  /**
-   * Creates a new group room with End-to-End Encryption (`m.megolm.v1.aes-sha2`)
-   * enabled by default and immediately shares the Megolm session key with invited members.
-   */
   async function createGroupRoom(name, topic, invitedHandlesOrIds) {
     var s = getStoredSession();
     if (!s) throw new Error("غير مسجل الدخول");
@@ -1267,6 +1343,7 @@ window.RunMatrixClient = (function () {
     if (!asciiPrefix) asciiPrefix = "RUN";
     var permanentCode = asciiPrefix + "-" + codeNum;
     var aliasLocal = permanentCode.toLowerCase();
+    var fullCanonicalAlias = "#" + aliasLocal + ":" + window.RUN_CONFIG.SERVER_DOMAIN;
 
     var inviteUserIds = Array.from(
       new Set(
@@ -1305,10 +1382,21 @@ window.RunMatrixClient = (function () {
     var resp = await apiRequest("POST", "/_matrix/client/v3/createRoom", payload);
     var roomId = resp.room_id;
 
+    // Also register uppercase alias in room directory so both #code and #CODE resolve directly
+    try {
+      var upperAlias = "#" + permanentCode.toUpperCase() + ":" + window.RUN_CONFIG.SERVER_DOMAIN;
+      await apiRequest(
+        "PUT",
+        "/_matrix/client/v3/directory/room/" + encodeURIComponent(upperAlias),
+        { room_id: roomId }
+      );
+    } catch (_) {}
+
     roomNameCache[roomId] = cleanName;
     roomTopicCache[roomId] = (topic || "").trim();
-    roomAliasCache[roomId] = "#" + aliasLocal + ":" + window.RUN_CONFIG.SERVER_DOMAIN;
+    roomAliasCache[roomId] = fullCanonicalAlias;
     roomMembersSetCache[roomId] = new Set([s.userId].concat(inviteUserIds));
+    savePersistedRoomMetadata(s.userId);
 
     var isEnc = await checkRoomEncryptionEnabled(roomId);
     if (isEnc) {
@@ -1338,10 +1426,6 @@ window.RunMatrixClient = (function () {
     };
   }
 
-  /**
-   * Creates or opens a 1-to-1 direct room with End-to-End Encryption (`m.megolm.v1.aes-sha2`)
-   * enabled by default and shares the Megolm session key with all of the peer's devices.
-   */
   async function createOrOpenDirectChat(targetHandleOrUserId) {
     var s = getStoredSession();
     if (!s) throw new Error("غير مسجل الدخول");
@@ -1374,6 +1458,7 @@ window.RunMatrixClient = (function () {
     var roomId = resp.room_id;
     directPeerCache[roomId] = targetUserId;
     roomMembersSetCache[roomId] = new Set([s.userId, targetUserId]);
+    savePersistedRoomMetadata(s.userId);
 
     var isEnc = await checkRoomEncryptionEnabled(roomId);
     if (isEnc) {
@@ -1384,11 +1469,181 @@ window.RunMatrixClient = (function () {
     return roomId;
   }
 
-  async function joinRoomByCodeOrId(codeOrRoomIdOrLink) {
-    var target = window.RUN_CONFIG.toInternalRoomAliasOrId(codeOrRoomIdOrLink);
-    var encoded = encodeURIComponent(target);
-    var resp = await apiRequest("POST", "/_matrix/client/v3/join/" + encoded, {});
-    var joinedRoomId = resp.room_id || target;
+  /**
+   * Resolves a room code (e.g. `AGEN-9641`), room alias (`#agen-9641:unredacted.org`),
+   * or `run://join/AGEN-9641` link into a canonical `!roomId:unredacted.org`
+   * using multi-case directory lookup + `/publicRooms` fallback.
+   */
+  async function resolveRoomCodeOrAliasToRoomId(codeOrRoomIdOrLink) {
+    var cleaned = window.RUN_CONFIG.cleanRoomCodeOrIdInput(codeOrRoomIdOrLink);
+    if (!cleaned) return null;
+
+    if (cleaned.startsWith("!") && cleaned.indexOf(":") !== -1) {
+      return {
+        roomId: cleaned,
+        roomCode: window.RUN_CONFIG.toPublicRoomCode(roomAliasCache[cleaned] || cleaned)
+      };
+    }
+
+    var candidateAliases = window.RUN_CONFIG.getCandidateRoomAliases(cleaned);
+
+    // 1. Try directory alias resolution across candidate cases (lowercase, uppercase, exact)
+    for (var i = 0; i < candidateAliases.length; i++) {
+      var alias = candidateAliases[i];
+      try {
+        var dirResp = await apiRequest(
+          "GET",
+          "/_matrix/client/v3/directory/room/" + encodeURIComponent(alias)
+        );
+        if (dirResp && dirResp.room_id) {
+          roomAliasCache[dirResp.room_id] = alias;
+          return {
+            roomId: dirResp.room_id,
+            alias: alias,
+            roomCode: window.RUN_CONFIG.toPublicRoomCode(alias)
+          };
+        }
+      } catch (_) {}
+    }
+
+    // 2. Fallback: search `/publicRooms` directory (matches canonical_alias, aliases, name, or roomId prefix)
+    var upperTarget = cleaned.toUpperCase();
+    var lowerTarget = cleaned.toLowerCase();
+    try {
+      var pubResp = await apiRequest("POST", "/_matrix/client/v3/publicRooms", {
+        limit: 100
+      });
+      var chunk = (pubResp && pubResp.chunk) || [];
+      for (var j = 0; j < chunk.length; j++) {
+        var item = chunk[j];
+        if (!item || !item.room_id) continue;
+        var canonical = item.canonical_alias || "";
+        var itemCode = window.RUN_CONFIG.toPublicRoomCode(canonical || item.room_id);
+        var aliasesList = Array.isArray(item.aliases) ? item.aliases : [];
+        var aliasMatched = aliasesList.some(function (a) {
+          return window.RUN_CONFIG.toPublicRoomCode(a) === upperTarget;
+        });
+        var namePrefix = String(item.name || "")
+          .replace(/[^A-Za-z0-9]/g, "")
+          .toUpperCase()
+          .slice(0, 4);
+
+        if (
+          itemCode === upperTarget ||
+          aliasMatched ||
+          String(canonical).toLowerCase().indexOf(lowerTarget) !== -1 ||
+          String(item.name || "").toUpperCase() === upperTarget ||
+          (upperTarget.startsWith(namePrefix + "-") &&
+            String(item.topic || "").toUpperCase().indexOf(upperTarget) !== -1)
+        ) {
+          if (canonical) roomAliasCache[item.room_id] = canonical;
+          if (item.name) roomNameCache[item.room_id] = item.name;
+          if (item.topic) roomTopicCache[item.room_id] = item.topic;
+          if (item.num_joined_members) roomMemberCountCache[item.room_id] = item.num_joined_members;
+          return {
+            roomId: item.room_id,
+            alias: canonical || candidateAliases[0] || "",
+            roomCode: upperTarget,
+            name: item.name || upperTarget,
+            memberCount: item.num_joined_members || 1
+          };
+        }
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  /**
+   * Joins a room by code (`AGEN-9641`), `run://join/AGEN-9641`, alias, or `roomId`.
+   * Guarantees first-try join across all entry points by:
+   * 1. Sanitizing invisible/bidi characters and resolving the code/alias to `roomId` first.
+   * 2. Joining via `/_matrix/client/v3/rooms/{roomId}/join` (or `/join/{roomIdOrAlias}` fallback).
+   * 3. Trying candidate alias cases if direct alias join is needed.
+   */
+  async function joinRoomByCodeOrId(codeOrRoomIdOrLink, optionalFallbackCode) {
+    var primaryInput = window.RUN_CONFIG.cleanRoomCodeOrIdInput(codeOrRoomIdOrLink);
+    var fallbackCode = window.RUN_CONFIG.cleanRoomCodeOrIdInput(optionalFallbackCode || "");
+    if (!primaryInput && !fallbackCode) {
+      throw new Error("يرجى إدخال كود الغرفة أو رابط الدعوة");
+    }
+
+    var lastError = null;
+
+    async function tryJoinSingleTarget(targetStr) {
+      var encoded = encodeURIComponent(targetStr);
+      // If target is a `!roomId:domain`, try `/rooms/{roomId}/join` first (avoids proxy `#` issues), then `/join/{roomId}`
+      if (targetStr.startsWith("!")) {
+        try {
+          var r1 = await apiRequest("POST", "/_matrix/client/v3/rooms/" + encoded + "/join", {});
+          return r1.room_id || targetStr;
+        } catch (e1) {
+          lastError = e1;
+        }
+      }
+      var r2 = await apiRequest("POST", "/_matrix/client/v3/join/" + encoded, {});
+      return r2.room_id || targetStr;
+    }
+
+    var joinedRoomId = null;
+
+    // Strategy 1: If primaryInput is already a `!roomId:domain`, try joining it directly
+    if (primaryInput.startsWith("!") && primaryInput.indexOf(":") !== -1) {
+      try {
+        joinedRoomId = await tryJoinSingleTarget(primaryInput);
+      } catch (err1) {
+        lastError = err1;
+      }
+    }
+
+    // Strategy 2: Resolve code/alias to canonical roomId & alias, then join
+    if (!joinedRoomId) {
+      var codeToResolve =
+        primaryInput.startsWith("!") && fallbackCode ? fallbackCode : primaryInput;
+      var resolved = await resolveRoomCodeOrAliasToRoomId(codeToResolve);
+      if (resolved && resolved.roomId) {
+        try {
+          joinedRoomId = await tryJoinSingleTarget(resolved.roomId);
+        } catch (err2) {
+          lastError = err2;
+          if (resolved.alias) {
+            try {
+              joinedRoomId = await tryJoinSingleTarget(resolved.alias);
+            } catch (err3) {
+              lastError = err3;
+            }
+          }
+        }
+      }
+    }
+
+    // Strategy 3: Try candidate aliases (`#agen-9641:unredacted.org`, `#AGEN-9641:unredacted.org`) directly
+    if (!joinedRoomId) {
+      var codeCandidate =
+        primaryInput.startsWith("!") && fallbackCode ? fallbackCode : primaryInput;
+      var aliases = window.RUN_CONFIG.getCandidateRoomAliases(codeCandidate);
+      for (var i = 0; i < aliases.length; i++) {
+        try {
+          joinedRoomId = await tryJoinSingleTarget(aliases[i]);
+          if (joinedRoomId) {
+            roomAliasCache[joinedRoomId] = aliases[i];
+            break;
+          }
+        } catch (errAlias) {
+          lastError = errAlias;
+        }
+      }
+    }
+
+    if (!joinedRoomId) {
+      throw lastError || new Error("لم يتم العثور على الحساب أو الغرفة المطلوبة");
+    }
+
+    var s = getStoredSession();
+    if (s && s.userId) {
+      savePersistedRoomMetadata(s.userId);
+    }
+
     var isEnc = await checkRoomEncryptionEnabled(joinedRoomId);
     if (isEnc) {
       shareMegolmKeyWithAllRoomDevices(joinedRoomId, {}).catch(function () {});
@@ -1473,14 +1728,14 @@ window.RunMatrixClient = (function () {
   async function searchUsers(query, knownFriendIdsSet, outgoingPendingIdsSet) {
     var s = getStoredSession();
     var myUserId = (s && s.userId) || "";
-    var cleanQuery = String(query || "")
-      .trim()
-      .replace(/^run:\/\/friend\//i, "");
+    var cleanQuery = window.RUN_CONFIG.stripInvisibleAndTrim(query).replace(
+      /^run:\/\/friend\//i,
+      ""
+    );
     if (!cleanQuery) return [];
 
     var resultsMap = {};
 
-    // 1. User directory search
     try {
       var dirResp = await apiRequest("POST", "/_matrix/client/v3/user_directory/search", {
         search_term: cleanQuery.replace(/^@/, ""),
@@ -1511,7 +1766,6 @@ window.RunMatrixClient = (function () {
       }
     } catch (_) {}
 
-    // 2. Direct @username profile lookup if not already in directory results
     var candidateId = window.RUN_CONFIG.toInternalUserId(cleanQuery);
     if (candidateId && candidateId !== myUserId && !resultsMap[candidateId]) {
       var profName = await fetchDisplayName(candidateId);
@@ -1539,52 +1793,77 @@ window.RunMatrixClient = (function () {
   }
 
   async function searchPublicRooms(query, joinedRoomIdsSet) {
-    var cleanQuery = String(query || "")
-      .trim()
-      .replace(/^run:\/\/join\//i, "");
+    var cleanQuery = window.RUN_CONFIG.cleanRoomCodeOrIdInput(query);
     var results = [];
     var seenIds = new Set();
 
-    // 1. Direct room code / alias lookup
+    // 1. If query is a single token (like AGEN-9641), resolve across candidate aliases first
     if (cleanQuery && cleanQuery.indexOf(" ") === -1) {
-      var alias = window.RUN_CONFIG.toInternalRoomAliasOrId(cleanQuery);
-      if (alias.startsWith("#")) {
-        try {
-          var aliasResp = await apiRequest(
-            "GET",
-            "/_matrix/client/v3/directory/room/" + encodeURIComponent(alias)
-          );
-          if (aliasResp && aliasResp.room_id) {
-            var rId = aliasResp.room_id;
-            seenIds.add(rId);
-            results.push({
-              roomId: rId,
-              name: roomNameCache[rId] || cleanQuery.toUpperCase(),
-              topic: roomTopicCache[rId] || "",
-              roomCode: window.RUN_CONFIG.toPublicRoomCode(alias),
-              memberCount: roomMemberCountCache[rId] || 1,
-              isJoined: joinedRoomIdsSet.has(rId),
-              avatarColor: window.RUN_CONFIG.avatarColorFor(rId)
-            });
-          }
-        } catch (_) {}
+      var resolved = await resolveRoomCodeOrAliasToRoomId(cleanQuery);
+      if (resolved && resolved.roomId) {
+        var rId = resolved.roomId;
+        seenIds.add(rId);
+        results.push({
+          roomId: rId,
+          name: resolved.name || roomNameCache[rId] || cleanQuery.toUpperCase(),
+          topic: roomTopicCache[rId] || "",
+          roomCode: resolved.roomCode || window.RUN_CONFIG.toPublicRoomCode(cleanQuery),
+          memberCount: resolved.memberCount || roomMemberCountCache[rId] || 1,
+          isJoined: joinedRoomIdsSet.has(rId),
+          avatarColor: window.RUN_CONFIG.avatarColorFor(rId)
+        });
       }
     }
 
-    // 2. Public rooms directory search
+    // 2. Public rooms directory search (also matches case-insensitively on client side)
     try {
-      var body = { limit: 30 };
-      if (cleanQuery) {
-        body.filter = { generic_search_term: cleanQuery };
-      }
-      var resp = await apiRequest("POST", "/_matrix/client/v3/publicRooms", body);
+      var resp = await apiRequest("POST", "/_matrix/client/v3/publicRooms", {
+        limit: 50
+      });
       var chunk = resp.chunk || [];
+      var qLower = cleanQuery.toLowerCase();
       for (var i = 0; i < chunk.length; i++) {
         var obj = chunk[i];
         var roomId = obj && obj.room_id;
-        if (!roomId || seenIds.has(roomId)) continue;
+        if (!roomId) continue;
         var canonical = obj.canonical_alias || "";
-        var code = window.RUN_CONFIG.toPublicRoomCode(canonical || roomId);
+        if (canonical) roomAliasCache[roomId] = canonical;
+        if (obj.name) roomNameCache[roomId] = obj.name;
+        if (obj.topic) roomTopicCache[roomId] = obj.topic;
+        if (obj.num_joined_members) roomMemberCountCache[roomId] = obj.num_joined_members;
+
+        var code = window.RUN_CONFIG.toPublicRoomCode(
+          canonical || roomAliasCache[roomId] || roomId
+        );
+
+        // If already added from step 1, enrich its name/memberCount from /publicRooms!
+        if (seenIds.has(roomId)) {
+          var existingIdx = results.findIndex(function (x) {
+            return x.roomId === roomId;
+          });
+          if (existingIdx !== -1) {
+            if (obj.name) results[existingIdx].name = obj.name;
+            if (obj.topic) results[existingIdx].topic = obj.topic;
+            if (obj.num_joined_members) results[existingIdx].memberCount = obj.num_joined_members;
+            if (canonical) results[existingIdx].roomCode = code;
+          }
+          continue;
+        }
+
+        if (cleanQuery) {
+          var hay = (
+            (obj.name || "") +
+            " " +
+            (obj.topic || "") +
+            " " +
+            canonical +
+            " " +
+            code
+          ).toLowerCase();
+          if (hay.indexOf(qLower) === -1) continue;
+        }
+
+        seenIds.add(roomId);
         results.push({
           roomId: roomId,
           name: obj.name || code,
@@ -1706,10 +1985,22 @@ window.RunMatrixClient = (function () {
     return Boolean(roomEncryptedCache[roomId]);
   }
 
+  function getCachedRoomName(roomId) {
+    return roomNameCache[roomId] || "";
+  }
+
+  function getCachedRoomCode(roomId) {
+    return window.RUN_CONFIG.toPublicRoomCode(roomAliasCache[roomId] || "");
+  }
+
   return {
     isLoggedIn: isLoggedIn,
     getCurrentAccountObject: getCurrentAccountObject,
     restoreExistingSessionIfAny: restoreExistingSessionIfAny,
+    getPersistedRoomsList: getPersistedRoomsList,
+    savePersistedRoomsList: savePersistedRoomsList,
+    getCachedRoomName: getCachedRoomName,
+    getCachedRoomCode: getCachedRoomCode,
     login: login,
     registerStep: registerStep,
     requestRegisterEmailToken: requestRegisterEmailToken,

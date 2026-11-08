@@ -1,5 +1,5 @@
 /**
- * Run v2 Web — Real 1-to-1 WebRTC Video & Voice Call Engine.
+ * Run v2 Web (v2.3.1) — Real 1-to-1 WebRTC Video & Voice Call Engine.
  *
  * Uses browser `RTCPeerConnection` and `navigator.mediaDevices.getUserMedia`:
  * - Supports dynamic TURN credentials from `/_matrix/client/v3/voip/turnServer`
@@ -8,7 +8,8 @@
  *   - `DEFAULT_480P` (854x480 @ 24fps, ~650 kbps)
  *   - `DATA_SAVER` (426x240 @ 15fps, ~250 kbps)
  *   - `AUDIO_ONLY` (audio only, zero video tracks)
- * - Working controls: Mic Mute/Unmute, Camera On/Off, Speaker Audio Mute/Unmute, End Call.
+ * - Separates media acquisition errors (`NotAllowedError`, `NotFoundError`, `NotReadableError`, etc.)
+ *   from WebRTC PeerConnection / SDP setup errors so the caller can report the exact cause.
  */
 window.RunWebRtcManager = (function () {
   var peerConnection = null;
@@ -40,11 +41,16 @@ window.RunWebRtcManager = (function () {
       turnCredentials.username &&
       turnCredentials.password
     ) {
-      iceServers.push({
-        urls: turnCredentials.uris,
-        username: turnCredentials.username,
-        credential: turnCredentials.password
+      var validUris = turnCredentials.uris.filter(function (u) {
+        return typeof u === "string" && /^(turns?|stuns?):/i.test(u.trim());
       });
+      if (validUris.length > 0) {
+        iceServers.push({
+          urls: validUris,
+          username: turnCredentials.username,
+          credential: turnCredentials.password
+        });
+      }
     }
     return iceServers;
   }
@@ -94,6 +100,119 @@ window.RunWebRtcManager = (function () {
     };
   }
 
+  /**
+   * Maps any media (`getUserMedia`) error to a clear, honest Arabic explanation
+   * while preserving `err.name` and `err.message`.
+   */
+  function describeMediaError(err, requestedVideo) {
+    var name = (err && err.name) || "MediaError";
+    var msg = (err && err.message) || "";
+    var deviceLabel = requestedVideo ? "الميكروفون أو الكاميرا" : "الميكروفون";
+
+    if (
+      name === "NotAllowedError" ||
+      name === "PermissionDeniedError" ||
+      name === "SecurityError"
+    ) {
+      return (
+        "تم رفض صلاحية الوصول إلى " +
+        deviceLabel +
+        " (" +
+        name +
+        ") — اضغط أيقونة القفل بجانب عنوان الموقع في المتصفح وفعّل الصلاحية ثم أعد المحاولة"
+      );
+    }
+    if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+      return "لم يتم العثور على " + deviceLabel + " متصل بهذا الجهاز (" + name + ")";
+    }
+    if (name === "NotReadableError" || name === "TrackStartError") {
+      return (
+        "تعذر تشغيل " +
+        deviceLabel +
+        " لأنه قيد الاستخدام من تطبيق آخر (" +
+        name +
+        (msg ? ": " + msg : "") +
+        ")"
+      );
+    }
+    if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
+      return "إعدادات جودة الكاميرا غير مدعومة على هذا الجهاز (" + name + ")";
+    }
+    return (
+      "تعذر الوصول إلى " +
+      deviceLabel +
+      " (" +
+      name +
+      (msg ? ": " + msg : "") +
+      ")"
+    );
+  }
+
+  /**
+   * Acquires local microphone (+ camera if video call) stream with fallback
+   * for mobile browsers that reject strict constraints.
+   */
+  async function acquireLocalMediaStream(qualityMode, requestedVideo) {
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+      var unsupErr = new Error(
+        "المتصفح الحالي لا يدعم الوصول إلى الميكروفون/الكاميرا (يتطلب HTTPS أو متصفحًا داعمًا لـ WebRTC)"
+      );
+      unsupErr.stage = "MEDIA";
+      unsupErr.name = "NotSupportedError";
+      console.error("[RunWebRTC/Media]", unsupErr.name, unsupErr.message);
+      throw unsupErr;
+    }
+
+    var useVideo = Boolean(requestedVideo && qualityMode !== "AUDIO_ONLY");
+    var primaryConstraints = buildMediaConstraints(qualityMode, useVideo);
+
+    try {
+      return await navigator.mediaDevices.getUserMedia(primaryConstraints);
+    } catch (err) {
+      console.warn(
+        "[RunWebRTC/Media] Primary getUserMedia failed:",
+        err && err.name,
+        err && err.message
+      );
+      // If mobile browser rejected ideal/max video or audio processing constraints, retry with minimal constraints
+      if (
+        err &&
+        (err.name === "OverconstrainedError" ||
+          err.name === "ConstraintNotSatisfiedError" ||
+          err.name === "TypeError")
+      ) {
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: useVideo ? { facingMode: "user" } : false
+          });
+        } catch (err2) {
+          console.error(
+            "[RunWebRTC/Media] Fallback getUserMedia failed:",
+            err2 && err2.name,
+            err2 && err2.message
+          );
+          var wrapped2 = new Error(describeMediaError(err2, useVideo));
+          wrapped2.stage = "MEDIA";
+          wrapped2.causeName = (err2 && err2.name) || "MediaError";
+          wrapped2.causeMessage = (err2 && err2.message) || "";
+          throw wrapped2;
+        }
+      }
+
+      console.error(
+        "[RunWebRTC/Media] getUserMedia error:",
+        err && err.name,
+        err && err.message
+      );
+      var wrapped = new Error(describeMediaError(err, useVideo));
+      wrapped.stage = "MEDIA";
+      wrapped.causeName = (err && err.name) || "MediaError";
+      wrapped.causeMessage = (err && err.message) || "";
+      throw wrapped;
+    }
+  }
+
   async function applyBitrateCap(pc, qualityMode) {
     if (!pc || typeof pc.getSenders !== "function") return;
     var maxBitrate =
@@ -130,9 +249,21 @@ window.RunWebRtcManager = (function () {
       remoteVideoEl.srcObject = remoteStream;
     }
 
-    var pc = new RTCPeerConnection({
-      iceServers: buildIceServers(turnCredentials)
-    });
+    var pc = null;
+    try {
+      pc = new RTCPeerConnection({
+        iceServers: buildIceServers(turnCredentials)
+      });
+    } catch (turnErr) {
+      console.warn(
+        "[RunWebRTC/ICE] RTCPeerConnection with TURN failed, falling back to STUN:",
+        turnErr && turnErr.name,
+        turnErr && turnErr.message
+      );
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+      });
+    }
 
     pc.onicecandidate = function (event) {
       if (event.candidate) {
@@ -173,7 +304,7 @@ window.RunWebRtcManager = (function () {
         if (typeof callbacks.onConnected === "function") {
           callbacks.onConnected();
         }
-      } else if (st === "failed" || st === "closed" || st === "disconnected") {
+      } else if (st === "failed" || st === "closed") {
         if (typeof callbacks.onEnded === "function") {
           callbacks.onEnded();
         }
@@ -185,43 +316,77 @@ window.RunWebRtcManager = (function () {
   }
 
   async function startOutgoingCall(options) {
-    var constraints = buildMediaConstraints(options.qualityMode, options.requestedVideo);
-    localStream = await navigator.mediaDevices.getUserMedia(constraints);
+    // Step 1: Acquire local media stream (throws stage="MEDIA" with exact cause on failure)
+    localStream = await acquireLocalMediaStream(options.qualityMode, options.requestedVideo);
     attachVideoElements(options.localVideoEl, options.remoteVideoEl);
 
-    var pc = createPeerConnection(options.turnCredentials, options.remoteVideoEl);
-    localStream.getTracks().forEach(function (track) {
-      pc.addTrack(track, localStream);
-    });
-    await applyBitrateCap(pc, options.qualityMode);
+    // Step 2: Create RTCPeerConnection and SDP offer (throws stage="WEBRTC" on failure)
+    try {
+      var pc = createPeerConnection(options.turnCredentials, options.remoteVideoEl);
+      localStream.getTracks().forEach(function (track) {
+        pc.addTrack(track, localStream);
+      });
+      await applyBitrateCap(pc, options.qualityMode);
 
-    var offer = await pc.createOffer({
-      offerToReceiveAudio: true,
-      offerToReceiveVideo: Boolean(options.requestedVideo && options.qualityMode !== "AUDIO_ONLY")
-    });
-    await pc.setLocalDescription(offer);
-    return offer.sdp;
+      var offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: Boolean(options.requestedVideo && options.qualityMode !== "AUDIO_ONLY")
+      });
+      await pc.setLocalDescription(offer);
+      return offer.sdp;
+    } catch (rtcErr) {
+      console.error(
+        "[RunWebRTC/Offer]",
+        rtcErr && rtcErr.name,
+        rtcErr && rtcErr.message
+      );
+      var wrappedRtc = new Error(
+        "تعذر تهيئة اتصال WebRTC (" +
+          ((rtcErr && rtcErr.name) || "Error") +
+          (rtcErr && rtcErr.message ? ": " + rtcErr.message : "") +
+          ")"
+      );
+      wrappedRtc.stage = "WEBRTC";
+      throw wrappedRtc;
+    }
   }
 
   async function answerIncomingCall(options) {
-    var constraints = buildMediaConstraints(options.qualityMode, options.requestedVideo);
-    localStream = await navigator.mediaDevices.getUserMedia(constraints);
+    // Step 1: Acquire local media stream
+    localStream = await acquireLocalMediaStream(options.qualityMode, options.requestedVideo);
     attachVideoElements(options.localVideoEl, options.remoteVideoEl);
 
-    var pc = createPeerConnection(options.turnCredentials, options.remoteVideoEl);
-    localStream.getTracks().forEach(function (track) {
-      pc.addTrack(track, localStream);
-    });
-    await applyBitrateCap(pc, options.qualityMode);
+    // Step 2: Set remote offer & create SDP answer
+    try {
+      var pc = createPeerConnection(options.turnCredentials, options.remoteVideoEl);
+      localStream.getTracks().forEach(function (track) {
+        pc.addTrack(track, localStream);
+      });
+      await applyBitrateCap(pc, options.qualityMode);
 
-    await pc.setRemoteDescription(
-      new RTCSessionDescription({ type: "offer", sdp: options.offerSdp })
-    );
-    await flushPendingRemoteCandidates();
+      await pc.setRemoteDescription(
+        new RTCSessionDescription({ type: "offer", sdp: options.offerSdp })
+      );
+      await flushPendingRemoteCandidates();
 
-    var answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    return answer.sdp;
+      var answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      return answer.sdp;
+    } catch (rtcErr) {
+      console.error(
+        "[RunWebRTC/Answer]",
+        rtcErr && rtcErr.name,
+        rtcErr && rtcErr.message
+      );
+      var wrappedRtc = new Error(
+        "تعذر إعداد رد اتصال WebRTC (" +
+          ((rtcErr && rtcErr.name) || "Error") +
+          (rtcErr && rtcErr.message ? ": " + rtcErr.message : "") +
+          ")"
+      );
+      wrappedRtc.stage = "WEBRTC";
+      throw wrappedRtc;
+    }
   }
 
   async function onRemoteAnswerReceived(answerSdp) {
