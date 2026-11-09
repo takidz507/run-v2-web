@@ -1,22 +1,87 @@
 /**
- * Run v2 Web (v2.3.1) — Real Matrix Client-Server v3 API Layer.
+ * Run v2 Web (v2.3.2) — Real Matrix Client-Server v3 API Layer.
  *
  * Connects to `window.RUN_CONFIG.HOMESERVER_BASE_URL` (`https://matrix.unredacted.org`)
  * and integrates with `window.RunCryptoEngine` for full Olm/Megolm E2EE interoperability
  * with Element and Cinny.
  *
- * Fixes in v2.3.1:
- * - Persists room metadata caches (`roomNameCache`, `roomAliasCache`, `roomEncryptedCache`, etc.)
- *   and cached room summaries in `localStorage` so rooms appear immediately on page reload
- *   and never lose metadata across incremental `/sync` batches.
- * - Multi-strategy room join (`joinRoomByCodeOrId`) and search (`searchPublicRooms`) that resolve
- *   room codes (`AGEN-9641`, `#agen-9641:unredacted.org`, `run://join/AGEN-9641`, or `!roomId`)
- *   reliably on the first attempt from every entry point (Search results button, code input, or pasted link).
+ * Fixes in v2.3.2:
+ * - Filtered `/sync` with `lazy_load_members: true`, `presence: { types: [] }`, and `timeline.limit: 10`
+ *   so accounts joined to huge public rooms (`Unredacted Space` ~9066 members, `Unredacted Announcements` ~6631 members)
+ *   never download 15,000+ member/presence events on initial sync (~3–15 KB instead of ~10 MB).
+ * - Split initial sync into two passes:
+ *   1. Ultra-light first pass (`syncFirstPassLight`, `timeline.limit: 1`, `lazy_load_members: true`, plus
+ *      `/joined_rooms` minimal state fallback) so room summaries appear in seconds even on 12–30 KB/s connections.
+ *   2. Filtered timeline pass (`timeline.limit: 10`, `lazy_load_members: true`) + progressive lazy member loading.
+ * - Client-side `AbortController` timeout on `apiRequest` so stalled mobile connections abort cleanly.
+ * - Persists `sinceToken` alongside room summaries & metadata in `localStorage` so page reloads resume
+ *   incremental sync directly while displaying cached rooms immediately.
  */
 window.RunMatrixClient = (function () {
   var SESSION_STORAGE_KEY = "run_v2_web_session_v2";
   var ROOMS_CACHE_PREFIX = "run_v2_web_rooms_cache_";
   var META_CACHE_PREFIX = "run_v2_web_room_meta_";
+  var SYNC_TOKEN_PREFIX = "run_v2_web_sync_token_";
+
+  /**
+   * Pass 1 filter: Ultra-light initial pass to retrieve joined rooms and minimal room state
+   * (`m.room.name`, `m.room.canonical_alias`, `m.room.encryption`, `m.room.topic`) + `summary`
+   * (`m.heroes`, `m.joined_member_count`) with `timeline.limit: 1` and `lazy_load_members: true`.
+   * Excludes `m.room.member` state dumps and `presence` events completely (~3 KB total).
+   */
+  var LIGHT_FIRST_PASS_FILTER = JSON.stringify({
+    presence: { types: [] },
+    account_data: { types: ["m.direct"] },
+    room: {
+      include_leave: false,
+      state: {
+        lazy_load_members: true,
+        types: [
+          "m.room.name",
+          "m.room.canonical_alias",
+          "m.room.aliases",
+          "m.room.encryption",
+          "m.room.topic"
+        ]
+      },
+      timeline: {
+        limit: 1,
+        lazy_load_members: true
+      },
+      ephemeral: { types: [] },
+      account_data: { types: [] }
+    }
+  });
+
+  /**
+   * Pass 2 & incremental `/sync` filter: Limits timeline to 10 events per room, enables
+   * `lazy_load_members: true` on both state and timeline (so huge public rooms with 9,000+ members
+   * only include senders of the 10 timeline events), and omits bulk server presence events.
+   */
+  var STANDARD_SYNC_FILTER = JSON.stringify({
+    presence: { types: [] },
+    account_data: { types: ["m.direct"] },
+    room: {
+      include_leave: false,
+      state: {
+        lazy_load_members: true,
+        types: [
+          "m.room.name",
+          "m.room.canonical_alias",
+          "m.room.aliases",
+          "m.room.encryption",
+          "m.room.topic",
+          "m.room.member"
+        ]
+      },
+      timeline: {
+        limit: 10,
+        lazy_load_members: true
+      },
+      ephemeral: { types: ["m.receipt"] },
+      account_data: { types: [] }
+    }
+  });
 
   var roomNameCache = {};
   var roomTopicCache = {};
@@ -25,6 +90,7 @@ window.RunMatrixClient = (function () {
   var roomEncryptionNoteCache = {};
   var roomMemberCountCache = {};
   var roomMembersSetCache = {};
+  var roomMembersLazyLoaded = {};
   var directPeerCache = {};
   var userDisplayNameCache = {};
   var userPresenceCache = {};
@@ -51,6 +117,7 @@ window.RunMatrixClient = (function () {
       try {
         localStorage.removeItem(ROOMS_CACHE_PREFIX + s.userId);
         localStorage.removeItem(META_CACHE_PREFIX + s.userId);
+        localStorage.removeItem(SYNC_TOKEN_PREFIX + s.userId);
       } catch (_) {}
     }
     try {
@@ -64,8 +131,26 @@ window.RunMatrixClient = (function () {
   }
 
   // =========================================================================
-  // PERSISTENT ROOM SUMMARIES & METADATA CACHE (Fixes Bug 1)
+  // PERSISTENT ROOM SUMMARIES, METADATA & SYNC TOKEN CACHE (Fixes Bug 1)
   // =========================================================================
+
+  function getPersistedSyncToken() {
+    var s = getStoredSession();
+    if (!s || !s.userId) return null;
+    try {
+      return localStorage.getItem(SYNC_TOKEN_PREFIX + s.userId) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function savePersistedSyncToken(token) {
+    var s = getStoredSession();
+    if (!s || !s.userId || !token) return;
+    try {
+      localStorage.setItem(SYNC_TOKEN_PREFIX + s.userId, String(token));
+    } catch (_) {}
+  }
 
   function loadPersistedRoomMetadata(userId) {
     if (!userId) return;
@@ -225,8 +310,16 @@ window.RunMatrixClient = (function () {
     return "تعذر إتمام العملية (رمز الحالة " + httpCode + ")";
   }
 
-  async function apiRequest(method, pathAndQuery, bodyObj, authenticated) {
+  /**
+   * Executes an HTTP request against the homeserver with client-side AbortController timeout
+   * so slow/stalled mobile connections abort cleanly rather than hanging or failing silently.
+   */
+  async function apiRequest(method, pathAndQuery, bodyObj, authenticated, options) {
+    var opts = options || {};
     var useAuth = authenticated !== false;
+    var timeoutMs =
+      opts.timeoutMs || (String(pathAndQuery).indexOf("/sync") !== -1 ? 42000 : 25000);
+
     var headers = {
       Accept: "application/json"
     };
@@ -241,25 +334,56 @@ window.RunMatrixClient = (function () {
       headers["Authorization"] = "Bearer " + session.accessToken;
     }
 
+    var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    var timeoutId = null;
+    if (controller && timeoutMs > 0) {
+      timeoutId = setTimeout(function () {
+        try {
+          controller.abort();
+        } catch (_) {}
+      }, timeoutMs);
+    }
+
     var resp;
     try {
       resp = await fetch(window.RUN_CONFIG.HOMESERVER_BASE_URL + pathAndQuery, {
         method: method,
         headers: headers,
-        body: bodyObj !== undefined && bodyObj !== null ? JSON.stringify(bodyObj) : undefined
+        body: bodyObj !== undefined && bodyObj !== null ? JSON.stringify(bodyObj) : undefined,
+        signal: controller ? controller.signal : undefined
       });
     } catch (netErr) {
+      if (timeoutId) clearTimeout(timeoutId);
+      var isAbort = netErr && netErr.name === "AbortError";
       var wrappedNet = new Error(
-        "تعذر الاتصال بالسيرفر — تحقق من اتصال الإنترنت (" +
-          ((netErr && netErr.message) || "NetworkError") +
-          ")"
+        isAbort
+          ? "انتهت مهلة الاتصال بالسيرفر على الشبكة البطيئة"
+          : "تعذر الاتصال بالسيرفر — تحقق من اتصال الإنترنت (" +
+              ((netErr && netErr.message) || "NetworkError") +
+              ")"
       );
       wrappedNet.isNetworkError = true;
       wrappedNet.causeName = (netErr && netErr.name) || "TypeError";
       throw wrappedNet;
     }
 
-    var rawText = await resp.text();
+    var rawText;
+    try {
+      rawText = await resp.text();
+    } catch (readErr) {
+      if (timeoutId) clearTimeout(timeoutId);
+      var wrappedRead = new Error(
+        "انقطع تنزيل البيانات على الشبكة البطيئة (" +
+          ((readErr && readErr.message) || "StreamError") +
+          ")"
+      );
+      wrappedRead.isNetworkError = true;
+      wrappedRead.causeName = (readErr && readErr.name) || "TypeError";
+      throw wrappedRead;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+
     if (!resp.ok) {
       var err = new Error(mapErrorToArabic(rawText, resp.status, pathAndQuery));
       err.httpStatus = resp.status;
@@ -512,6 +636,7 @@ window.RunMatrixClient = (function () {
     roomEncryptionNoteCache = {};
     roomMemberCountCache = {};
     roomMembersSetCache = {};
+    roomMembersLazyLoaded = {};
     directPeerCache = {};
   }
 
@@ -768,21 +893,149 @@ window.RunMatrixClient = (function () {
   }
 
   // =========================================================================
-  // 4. REAL-TIME /SYNC LOOP
+  // 4. TWO-PASS FILTERED /SYNC & PROGRESSIVE LAZY MEMBER LOADING (Fixes Bug 1)
   // =========================================================================
 
-  async function sync(sinceToken, timeoutMs) {
+  /**
+   * Ultra-light fallback via `GET /_matrix/client/v3/joined_rooms` (~200 bytes) + minimal state
+   * so that even on a severely throttled link (12–30 KB/s), the user's joined rooms list can be
+   * constructed quickly if a full sync response is delayed.
+   */
+  async function fetchJoinedRoomsMinimalFallback() {
     var s = getStoredSession();
     if (!s) throw new Error("غير مسجل الدخول");
     var myUserId = s.userId;
 
-    var query = "/_matrix/client/v3/sync?timeout=" + (sinceToken ? timeoutMs || 12000 : 0);
+    var resp = await apiRequest("GET", "/_matrix/client/v3/joined_rooms", null, true, {
+      timeoutMs: 20000
+    });
+    var joinedIds = Array.isArray(resp.joined_rooms) ? resp.joined_rooms : [];
+    var summaries = [];
+
+    for (var i = 0; i < joinedIds.length; i++) {
+      var rId = joinedIds[i];
+      if (!roomNameCache[rId]) {
+        try {
+          var nameObj = await apiRequest(
+            "GET",
+            "/_matrix/client/v3/rooms/" + encodeURIComponent(rId) + "/state/m.room.name",
+            null,
+            true,
+            { timeoutMs: 8000 }
+          );
+          if (nameObj && nameObj.name) {
+            roomNameCache[rId] = nameObj.name;
+          }
+        } catch (_) {}
+      }
+      if (!roomAliasCache[rId]) {
+        try {
+          var aliasObj = await apiRequest(
+            "GET",
+            "/_matrix/client/v3/rooms/" + encodeURIComponent(rId) + "/state/m.room.canonical_alias",
+            null,
+            true,
+            { timeoutMs: 8000 }
+          );
+          if (aliasObj && aliasObj.alias) {
+            roomAliasCache[rId] = aliasObj.alias;
+          }
+        } catch (_) {}
+      }
+      var isEnc = await checkRoomEncryptionEnabled(rId);
+      var directPeer = directPeerCache[rId] || null;
+      var isDirect = Boolean(directPeer);
+      var name =
+        roomNameCache[rId] ||
+        (directPeer
+          ? userDisplayNameCache[directPeer] ||
+            window.RUN_CONFIG.toPublicHandle(directPeer).replace(/^@/, "")
+          : "") ||
+        window.RUN_CONFIG.toPublicRoomCode(roomAliasCache[rId]) ||
+        "غرفة Run";
+      var code = isDirect
+        ? window.RUN_CONFIG.toPublicHandle(directPeer)
+        : window.RUN_CONFIG.toPublicRoomCode(roomAliasCache[rId] || rId);
+
+      summaries.push({
+        roomId: rId,
+        name: name,
+        topic: roomTopicCache[rId] || "",
+        roomCode: code,
+        isDirect: isDirect,
+        directPeerUserId: directPeer,
+        memberCount: roomMemberCountCache[rId] || 1,
+        lastMessageSender: null,
+        lastMessageBody: isDirect ? "محادثة خاصة" : "غرفة Run",
+        lastMessageTimestamp: 0,
+        unreadCount: 0,
+        isEncrypted: isEnc,
+        encryptionStatusNote: isEnc ? null : "غير مشفرة — الرسائل في هذه الغرفة غير مشفرة",
+        avatarColor: window.RUN_CONFIG.avatarColorFor(directPeer || rId),
+        peerPresence: "offline"
+      });
+    }
+
+    savePersistedRoomMetadata(myUserId);
+    return summaries;
+  }
+
+  /**
+   * Pass 1: Fast, ultra-light initial `/sync` (`LIGHT_FIRST_PASS_FILTER`: `timeline.limit: 1`,
+   * `lazy_load_members: true`, `presence.types: []`, no member state dumps) so room summaries
+   * download in ~3 KB and appear immediately on slow mobile data (12–30 KB/s).
+   * Falls back to `fetchJoinedRoomsMinimalFallback()` if needed.
+   */
+  async function syncFirstPassLight() {
+    try {
+      return await sync(null, 0, { lightFirstPass: true, timeoutMs: 30000 });
+    } catch (firstPassErr) {
+      console.warn(
+        "[RunSync] Light first-pass /sync failed, attempting /joined_rooms minimal bootstrap:",
+        firstPassErr && firstPassErr.message
+      );
+      var fallbackRooms = await fetchJoinedRoomsMinimalFallback();
+      return {
+        nextBatch: null,
+        rooms: fallbackRooms,
+        incomingFriendInvites: [],
+        outgoingFriendInvites: [],
+        friends: [],
+        newMessagesByRoom: {},
+        signalingEvents: []
+      };
+    }
+  }
+
+  /**
+   * Main `/sync` method — ALWAYS applies a Matrix `filter` (`LIGHT_FIRST_PASS_FILTER` or
+   * `STANDARD_SYNC_FILTER` with `lazy_load_members: true` and `timeline.limit: 10`) so huge
+   * public rooms (9,000+ members) never stall or fail mobile downloads.
+   */
+  async function sync(sinceToken, timeoutMs, options) {
+    var s = getStoredSession();
+    if (!s) throw new Error("غير مسجل الدخول");
+    var myUserId = s.userId;
+    var opts = options || {};
+
+    var filterJson = opts.lightFirstPass ? LIGHT_FIRST_PASS_FILTER : STANDARD_SYNC_FILTER;
+    var waitTimeout = sinceToken ? timeoutMs || 12000 : 0;
+    var query =
+      "/_matrix/client/v3/sync?timeout=" +
+      waitTimeout +
+      "&filter=" +
+      encodeURIComponent(filterJson);
+
     if (sinceToken) {
       query += "&since=" + encodeURIComponent(sinceToken);
     }
 
-    var root = await apiRequest("GET", query);
+    var reqTimeout = opts.timeoutMs || (sinceToken ? waitTimeout + 25000 : 38000);
+    var root = await apiRequest("GET", query, null, true, { timeoutMs: reqTimeout });
     var nextBatch = root.next_batch || sinceToken || "";
+    if (nextBatch) {
+      savePersistedSyncToken(nextBatch);
+    }
 
     // 1. Process incoming to_device events FIRST
     var toDeviceEvents = (root.to_device && root.to_device.events) || [];
@@ -836,7 +1089,7 @@ window.RunMatrixClient = (function () {
       }
     }
 
-    // 5. Parse Presence events
+    // 5. Parse Presence events (if any)
     var presenceEvents = (root.presence && root.presence.events) || [];
     for (var prIdx = 0; prIdx < presenceEvents.length; prIdx++) {
       var prEv = presenceEvents[prIdx];
@@ -1049,6 +1302,9 @@ window.RunMatrixClient = (function () {
 
       var heroes = summaryObj["m.heroes"] || [];
       var heroUserId = heroes.length > 0 ? heroes[0] : null;
+      if (heroUserId) {
+        memberSet.add(heroUserId);
+      }
       var totalMembers = Math.max(1, roomMemberCountCache[roomId] || memberSet.size);
 
       var directPeer =
@@ -1056,6 +1312,10 @@ window.RunMatrixClient = (function () {
         (totalMembers <= 2 && !roomNameCache[roomId]
           ? heroUserId || joinedOtherUser || invitedOtherUser
           : null);
+
+      if (directPeer) {
+        directPeerCache[roomId] = directPeer;
+      }
 
       var isDirectRoom = Boolean(directPeer);
       var resolvedName =
@@ -1077,7 +1337,7 @@ window.RunMatrixClient = (function () {
         var peerDisplay =
           userDisplayNameCache[directPeer] ||
           window.RUN_CONFIG.toPublicHandle(directPeer).replace(/^@/, "");
-        if (invitedOtherUser === directPeer && !joinedOtherUser) {
+        if (invitedOtherUser === directPeer && !joinedOtherUser && invitedCount > 0) {
           outgoingFriendInvites.push({
             roomId: roomId,
             internalUserId: directPeer,
@@ -1180,6 +1440,55 @@ window.RunMatrixClient = (function () {
     };
   }
 
+  /**
+   * Progressively & lazily loads member display names for small/DM rooms (`memberCount <= 40`)
+   * in the background AFTER initial sync completes, skipping huge public rooms (`Unredacted Space`).
+   */
+  async function lazyLoadRoomMembersForSmallRooms(roomsList) {
+    var s = getStoredSession();
+    if (!s || !s.userId || !Array.isArray(roomsList)) return false;
+    var myUserId = s.userId;
+    var updatedAny = false;
+
+    for (var i = 0; i < roomsList.length; i++) {
+      var r = roomsList[i];
+      if (!r || !r.roomId) continue;
+      if (roomMembersLazyLoaded[r.roomId]) continue;
+
+      // Never auto-download full member lists for massive public rooms (> 40 members)
+      if ((r.memberCount || 0) > 40) {
+        roomMembersLazyLoaded[r.roomId] = true;
+        continue;
+      }
+
+      // If it's a 1-to-1 DM room and we only need the peer's display name, fetch just their profile!
+      if (r.isDirect && r.directPeerUserId && !userDisplayNameCache[r.directPeerUserId]) {
+        var dName = await fetchDisplayName(r.directPeerUserId);
+        if (dName) {
+          userDisplayNameCache[r.directPeerUserId] = dName;
+          if (!roomNameCache[r.roomId]) {
+            r.name = dName;
+            updatedAny = true;
+          }
+        }
+        roomMembersLazyLoaded[r.roomId] = true;
+        continue;
+      }
+
+      // For small group rooms (<= 40 members), lazily fetch joined members once
+      try {
+        await getOrFetchRoomMemberUserIds(r.roomId);
+        roomMembersLazyLoaded[r.roomId] = true;
+      } catch (_) {}
+    }
+
+    if (updatedAny) {
+      savePersistedRoomMetadata(myUserId);
+      savePersistedRoomsList(roomsList);
+    }
+    return updatedAny;
+  }
+
   // =========================================================================
   // 5. ROOMS, MESSAGES, CREATION & MULTI-STRATEGY JOIN BY CODE (Fixes Bug 3)
   // =========================================================================
@@ -1192,7 +1501,10 @@ window.RunMatrixClient = (function () {
       var encoded = encodeURIComponent(roomId);
       var stateObj = await apiRequest(
         "GET",
-        "/_matrix/client/v3/rooms/" + encoded + "/state/m.room.encryption"
+        "/_matrix/client/v3/rooms/" + encoded + "/state/m.room.encryption",
+        null,
+        true,
+        { timeoutMs: 10000 }
       );
       var enabled = Boolean(stateObj && stateObj.algorithm === window.RUN_CONFIG.MEGOLM_ALGORITHM);
       roomEncryptedCache[roomId] = enabled;
@@ -1212,9 +1524,15 @@ window.RunMatrixClient = (function () {
     if (!s) throw new Error("غير مسجل الدخول");
     var myUserId = s.userId;
     var encoded = encodeURIComponent(roomId);
+    var msgFilter = JSON.stringify({ lazy_load_members: true });
     var resp = await apiRequest(
       "GET",
-      "/_matrix/client/v3/rooms/" + encoded + "/messages?dir=b&limit=" + (limit || 60)
+      "/_matrix/client/v3/rooms/" +
+        encoded +
+        "/messages?dir=b&limit=" +
+        (limit || 25) +
+        "&filter=" +
+        encodeURIComponent(msgFilter)
     );
     var chunk = resp.chunk || [];
     var list = [];
@@ -1556,10 +1874,6 @@ window.RunMatrixClient = (function () {
 
   /**
    * Joins a room by code (`AGEN-9641`), `run://join/AGEN-9641`, alias, or `roomId`.
-   * Guarantees first-try join across all entry points by:
-   * 1. Sanitizing invisible/bidi characters and resolving the code/alias to `roomId` first.
-   * 2. Joining via `/_matrix/client/v3/rooms/{roomId}/join` (or `/join/{roomIdOrAlias}` fallback).
-   * 3. Trying candidate alias cases if direct alias join is needed.
    */
   async function joinRoomByCodeOrId(codeOrRoomIdOrLink, optionalFallbackCode) {
     var primaryInput = window.RUN_CONFIG.cleanRoomCodeOrIdInput(codeOrRoomIdOrLink);
@@ -1572,7 +1886,6 @@ window.RunMatrixClient = (function () {
 
     async function tryJoinSingleTarget(targetStr) {
       var encoded = encodeURIComponent(targetStr);
-      // If target is a `!roomId:domain`, try `/rooms/{roomId}/join` first (avoids proxy `#` issues), then `/join/{roomId}`
       if (targetStr.startsWith("!")) {
         try {
           var r1 = await apiRequest("POST", "/_matrix/client/v3/rooms/" + encoded + "/join", {});
@@ -1587,7 +1900,6 @@ window.RunMatrixClient = (function () {
 
     var joinedRoomId = null;
 
-    // Strategy 1: If primaryInput is already a `!roomId:domain`, try joining it directly
     if (primaryInput.startsWith("!") && primaryInput.indexOf(":") !== -1) {
       try {
         joinedRoomId = await tryJoinSingleTarget(primaryInput);
@@ -1596,7 +1908,6 @@ window.RunMatrixClient = (function () {
       }
     }
 
-    // Strategy 2: Resolve code/alias to canonical roomId & alias, then join
     if (!joinedRoomId) {
       var codeToResolve =
         primaryInput.startsWith("!") && fallbackCode ? fallbackCode : primaryInput;
@@ -1617,7 +1928,6 @@ window.RunMatrixClient = (function () {
       }
     }
 
-    // Strategy 3: Try candidate aliases (`#agen-9641:unredacted.org`, `#AGEN-9641:unredacted.org`) directly
     if (!joinedRoomId) {
       var codeCandidate =
         primaryInput.startsWith("!") && fallbackCode ? fallbackCode : primaryInput;
@@ -1659,15 +1969,32 @@ window.RunMatrixClient = (function () {
   async function getOrFetchRoomMemberUserIds(roomId) {
     var s = getStoredSession();
     var myUserId = (s && s.userId) || "";
+    var cached = roomMembersSetCache[roomId];
+
+    // If room is known to be a massive public room (> 100 members), do not block on downloading all members
+    if ((roomMemberCountCache[roomId] || 0) > 100 && cached && cached.size > 0) {
+      return Array.from(cached);
+    }
+
     try {
       var encoded = encodeURIComponent(roomId);
-      var resp = await apiRequest("GET", "/_matrix/client/v3/rooms/" + encoded + "/members");
+      var resp = await apiRequest(
+        "GET",
+        "/_matrix/client/v3/rooms/" + encoded + "/members?membership=join",
+        null,
+        true,
+        { timeoutMs: 18000 }
+      );
       var chunk = resp.chunk || [];
       var set = new Set(myUserId ? [myUserId] : []);
       for (var i = 0; i < chunk.length; i++) {
         var ev = chunk[i];
         var uid = ev && ev.state_key;
-        var mem = ev && ev.content && ev.content.membership;
+        var content = (ev && ev.content) || {};
+        var mem = content.membership;
+        if (uid && content.displayname) {
+          userDisplayNameCache[uid] = content.displayname;
+        }
         if (uid && (mem === "join" || mem === "invite")) {
           set.add(uid);
         }
@@ -1675,7 +2002,6 @@ window.RunMatrixClient = (function () {
       roomMembersSetCache[roomId] = set;
       return Array.from(set);
     } catch (_) {
-      var cached = roomMembersSetCache[roomId];
       return cached ? Array.from(cached) : myUserId ? [myUserId] : [];
     }
   }
@@ -1684,12 +2010,20 @@ window.RunMatrixClient = (function () {
     var s = getStoredSession();
     var myUserId = (s && s.userId) || "";
     var encoded = encodeURIComponent(roomId);
-    var resp = await apiRequest("GET", "/_matrix/client/v3/rooms/" + encoded + "/members");
+    var resp = await apiRequest(
+      "GET",
+      "/_matrix/client/v3/rooms/" + encoded + "/members?membership=join",
+      null,
+      true,
+      { timeoutMs: 20000 }
+    );
     var chunk = resp.chunk || [];
     var members = [];
     var memberIds = [];
 
-    for (var i = 0; i < chunk.length; i++) {
+    // Cap rendered/queried members to 80 so huge public rooms (e.g. 9066 members) stay fast
+    var maxItems = Math.min(chunk.length, 80);
+    for (var i = 0; i < maxItems; i++) {
       var ev = chunk[i];
       var uid = ev && ev.state_key;
       var content = (ev && ev.content) || {};
@@ -1698,6 +2032,9 @@ window.RunMatrixClient = (function () {
       memberIds.push(uid);
       var handle = window.RUN_CONFIG.toPublicHandle(uid);
       var dName = content.displayname || handle.replace(/^@/, "");
+      if (content.displayname) {
+        userDisplayNameCache[uid] = content.displayname;
+      }
       var role = uid === myUserId ? "أنت · عضو" : mem === "invite" ? "مدعو" : "عضو";
       members.push({
         userId: uid,
@@ -1711,9 +2048,9 @@ window.RunMatrixClient = (function () {
     }
 
     try {
-      await queryDevicesForUsers(memberIds);
+      await queryDevicesForUsers(memberIds.slice(0, 40));
     } catch (_) {}
-    var devices = window.RunCryptoEngine.getKnownDevicesForUsers(memberIds);
+    var devices = window.RunCryptoEngine.getKnownDevicesForUsers(memberIds.slice(0, 40));
 
     return {
       members: members,
@@ -1797,7 +2134,6 @@ window.RunMatrixClient = (function () {
     var results = [];
     var seenIds = new Set();
 
-    // 1. If query is a single token (like AGEN-9641), resolve across candidate aliases first
     if (cleanQuery && cleanQuery.indexOf(" ") === -1) {
       var resolved = await resolveRoomCodeOrAliasToRoomId(cleanQuery);
       if (resolved && resolved.roomId) {
@@ -1815,7 +2151,6 @@ window.RunMatrixClient = (function () {
       }
     }
 
-    // 2. Public rooms directory search (also matches case-insensitively on client side)
     try {
       var resp = await apiRequest("POST", "/_matrix/client/v3/publicRooms", {
         limit: 50
@@ -1836,7 +2171,6 @@ window.RunMatrixClient = (function () {
           canonical || roomAliasCache[roomId] || roomId
         );
 
-        // If already added from step 1, enrich its name/memberCount from /publicRooms!
         if (seenIds.has(roomId)) {
           var existingIdx = results.findIndex(function (x) {
             return x.roomId === roomId;
@@ -1954,7 +2288,13 @@ window.RunMatrixClient = (function () {
   async function fetchDisplayName(userId) {
     try {
       var encoded = encodeURIComponent(userId);
-      var obj = await apiRequest("GET", "/_matrix/client/v3/profile/" + encoded + "/displayname");
+      var obj = await apiRequest(
+        "GET",
+        "/_matrix/client/v3/profile/" + encoded + "/displayname",
+        null,
+        true,
+        { timeoutMs: 8000 }
+      );
       return obj.displayname || window.RUN_CONFIG.toPublicHandle(userId).replace(/^@/, "");
     } catch (_) {
       return null;
@@ -1964,7 +2304,13 @@ window.RunMatrixClient = (function () {
   async function fetchUserPresence(userId) {
     try {
       var encoded = encodeURIComponent(userId);
-      var obj = await apiRequest("GET", "/_matrix/client/v3/presence/" + encoded + "/status");
+      var obj = await apiRequest(
+        "GET",
+        "/_matrix/client/v3/presence/" + encoded + "/status",
+        null,
+        true,
+        { timeoutMs: 6000 }
+      );
       var p = obj.presence || "offline";
       userPresenceCache[userId] = p;
       return p;
@@ -1999,6 +2345,8 @@ window.RunMatrixClient = (function () {
     restoreExistingSessionIfAny: restoreExistingSessionIfAny,
     getPersistedRoomsList: getPersistedRoomsList,
     savePersistedRoomsList: savePersistedRoomsList,
+    getPersistedSyncToken: getPersistedSyncToken,
+    savePersistedSyncToken: savePersistedSyncToken,
     getCachedRoomName: getCachedRoomName,
     getCachedRoomCode: getCachedRoomCode,
     login: login,
@@ -2010,7 +2358,9 @@ window.RunMatrixClient = (function () {
     uploadPinKeyBackup: uploadPinKeyBackup,
     restorePinKeyBackup: restorePinKeyBackup,
     checkRemotePinBackupExists: checkRemotePinBackupExists,
+    syncFirstPassLight: syncFirstPassLight,
     sync: sync,
+    lazyLoadRoomMembersForSmallRooms: lazyLoadRoomMembersForSmallRooms,
     checkRoomEncryptionEnabled: checkRoomEncryptionEnabled,
     isRoomCurrentlyEncrypted: isRoomCurrentlyEncrypted,
     fetchRoomMessages: fetchRoomMessages,

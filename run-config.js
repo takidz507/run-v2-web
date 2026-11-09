@@ -1,10 +1,10 @@
 /**
- * Internal configuration for Run v2 Web (v2.3.1).
+ * Internal configuration for Run v2 Web (v2.3.2).
  * STRICT RULE: Never expose HOMESERVER_BASE_URL, SERVER_DOMAIN, "Matrix",
  * or "unredacted.org" in any user-facing UI string.
  */
 window.RUN_CONFIG = (function () {
-  var APP_VERSION = "2.3.1";
+  var APP_VERSION = "2.3.2";
   var HOMESERVER_BASE_URL = "https://matrix.unredacted.org";
   var SERVER_DOMAIN = "unredacted.org";
   var ACCOUNT_DATA_KEY_BACKUP_EVENT = "m.runv2.key_backup.v2";

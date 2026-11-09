@@ -1,26 +1,30 @@
 /**
- * Run v2 Web (v2.3.1) — Main UI Controller & State Loop.
+ * Run v2 Web (v2.3.2) — Main UI Controller & State Loop.
  *
- * Fixes implemented in v2.3.1:
- * 1. Bug 1 Fix (Rooms disappearing on refresh):
- *    - Loads cached room summaries from `localStorage` immediately on startup and renders them.
- *    - Tracks `state.initialSyncCompleted` and displays «جاري تحميل الغرف…» until the first
- *      `/sync` finishes — NEVER displays «لا توجد غرف» before the first sync completes.
- *    - Displays a visible sync error banner («تعذر المزامنة — إعادة المحاولة…») with a
- *      working «إعادة المحاولة» button whenever `/sync` fails, instead of retrying silently.
- *    - Preserves cached room names and last messages across incremental `/sync` deltas and saves
- *      updated room summaries to `localStorage`.
- * 2. Bug 2 Fix (Call start error hiding true cause):
- *    - Separates TURN credential fetch, `getUserMedia`, WebRTC offer creation, and `sendCallInvite`
- *      into distinct error-handled steps, logs `err.name` + `err.message` to `console`, and displays
- *      the true cause (permission denial vs missing mic/camera vs network/invite failure vs TURN warning).
- * 3. Bug 3 Fix (Intermittent join by code `AGEN-9641`):
- *    - Sanitizes invisible/bidi characters, provides a direct «انضمام الآن» card when typing a code,
- *      passes both `roomId` and `roomCode` from search results, and resolves aliases across cases.
+ * Fixes implemented in v2.3.2:
+ * 1. Bug 1 Fix (Sync failing on slow mobile data 12–30 KB/s):
+ *    - Splits initial load into a lightweight first pass (`syncFirstPassLight`: `timeline.limit: 1`,
+ *      `lazy_load_members: true`, `presence.types: []`, plus `/joined_rooms` minimal fallback) so
+ *      the rooms list renders and saves to `localStorage` within seconds even when the account is in
+ *      9,000-member public rooms (`Unredacted Space`).
+ *    - Follows immediately with a filtered timeline sync (`timeline.limit: 10`, `lazy_load_members: true`)
+ *      and progressive lazy member loading (`lazyLoadRoomMembersForSmallRooms`).
+ *    - Persists `sinceToken` in `localStorage` so page reloads resume incremental sync directly.
+ *    - Implements exponential backoff (`3.5s -> 7s -> 15s`) on sync errors while keeping the
+ *      immediate «إعادة المحاولة» button and loading/error indicators from v2.3.1.
+ * 2. Bug 2 Fix (Responsive layout for Mobile <=540px, Tablet 541–1023px, Desktop >=1024px):
+ *    - Mobile (`<=540px`): Single-column layout unchanged (`13.5px` chat font).
+ *    - Tablet (`541–1023px`): Wider single-column layout (`max-width: 720px`).
+ *    - Desktop (`>=1024px`): Full-width two-pane layout (`336px` left sidebar for Rooms/Search/Calls/Account
+ *      + `1fr` right conversation pane for Chat/RoomInfo/Call) with zero wasted side margins.
  */
 (function () {
+  var BACKOFF_DELAYS_MS = [3500, 7000, 15000];
+
   var state = {
     currentScreen: "login",
+    sidebarScreen: "rooms",
+    mainPaneScreen: "chat",
     authMode: "login",
     theme: "dark",
     callQuality: "DEFAULT_480P",
@@ -30,6 +34,7 @@
     initialSyncCompleted: false,
     isSyncInProgress: false,
     syncError: null,
+    syncRetryDelaySec: 3.5,
     spaceFilter: "ALL",
     activeRoom: null,
     messagesByRoom: {},
@@ -84,6 +89,7 @@
 
   var syncLoopActive = false;
   var syncRetryWakeResolver = null;
+  var consecutiveSyncFailures = 0;
   var callTimerInterval = null;
   var searchDebounceTimer = null;
 
@@ -141,24 +147,117 @@
     }, 5500);
   }
 
+  /**
+   * Navigates between screens while supporting BOTH:
+   * - Single-column mobile/tablet view (`< 1024px`, via `.screen.active`)
+   * - Two-pane desktop split view (`>= 1024px`, via `.authenticated-layout`,
+   *   `.desktop-sidebar-active` in the 336px left sidebar, and `.desktop-main-active`
+   *   in the right conversation pane).
+   */
   function showScreen(screenId) {
     state.currentScreen = screenId;
+    var isAuthFlow =
+      screenId === "login" || screenId === "pin" || screenId === "restored";
+
+    var appShell = document.getElementById("appShell");
+    if (appShell) {
+      appShell.classList.toggle("authenticated-layout", !isAuthFlow);
+    }
+
+    if (
+      screenId === "rooms" ||
+      screenId === "search" ||
+      screenId === "create" ||
+      screenId === "calls" ||
+      screenId === "settings"
+    ) {
+      state.sidebarScreen = screenId;
+      if (state.mainPaneScreen === "call" && state.activeCall.phase === "IDLE") {
+        state.mainPaneScreen = "chat";
+      }
+    } else if (screenId === "chat" || screenId === "roominfo" || screenId === "call") {
+      state.mainPaneScreen = screenId;
+    }
+
     var allScreens = document.querySelectorAll(".screen");
     for (var i = 0; i < allScreens.length; i++) {
-      allScreens[i].classList.toggle("active", allScreens[i].id === "scr-" + screenId);
+      var el = allScreens[i];
+      el.classList.toggle("active", el.id === "scr-" + screenId);
+      el.classList.toggle(
+        "desktop-sidebar-active",
+        !isAuthFlow && el.id === "scr-" + state.sidebarScreen
+      );
+      el.classList.toggle(
+        "desktop-main-active",
+        !isAuthFlow && el.id === "scr-" + state.mainPaneScreen
+      );
     }
 
     var tabBar = document.getElementById("bottomTabBar");
     var isMainTab = screenId === "rooms" || screenId === "calls" || screenId === "settings";
     if (tabBar) {
-      tabBar.classList.toggle("hidden", !isMainTab);
+      tabBar.classList.toggle("hidden", isAuthFlow || !isMainTab);
     }
+
+    var activeTabTarget =
+      state.sidebarScreen === "calls"
+        ? "calls"
+        : state.sidebarScreen === "settings"
+        ? "settings"
+        : "rooms";
 
     var tabBtns = document.querySelectorAll("[data-main-tab]");
     for (var j = 0; j < tabBtns.length; j++) {
       var btn = tabBtns[j];
-      btn.classList.toggle("active", btn.getAttribute("data-main-tab") === screenId);
+      var tabName = btn.getAttribute("data-main-tab");
+      btn.classList.toggle(
+        "active",
+        window.innerWidth >= 1024 ? tabName === activeTabTarget : tabName === screenId
+      );
     }
+
+    if (!isAuthFlow) {
+      updateChatHeader();
+      renderChatMessages();
+    }
+  }
+
+  /**
+   * On Desktop (`>= 1024px`), automatically selects the first available room into the right
+   * conversation pane if no room is currently selected so both panes are populated side-by-side.
+   */
+  function ensureDesktopActiveRoomSelected() {
+    if (window.innerWidth < 1024) return;
+    if (state.activeRoom || state.rooms.length === 0) return;
+    var firstRoom = state.rooms[0];
+    if (!firstRoom) return;
+    state.activeRoom = firstRoom;
+    updateChatHeader();
+    renderChatMessages();
+    renderRoomsList();
+    window.RunMatrixClient.fetchRoomMessages(firstRoom.roomId, 25)
+      .then(function (history) {
+        if (!Array.isArray(history) || history.length === 0) return;
+        var currentList = state.messagesByRoom[firstRoom.roomId] || [];
+        var existingIds = new Set(
+          currentList.map(function (m) {
+            return m.eventId;
+          })
+        );
+        var merged = history
+          .filter(function (m) {
+            return !existingIds.has(m.eventId);
+          })
+          .concat(currentList)
+          .sort(function (a, b) {
+            return (a.timestamp || 0) - (b.timestamp || 0);
+          });
+        state.messagesByRoom[firstRoom.roomId] = merged;
+        if (state.activeRoom && state.activeRoom.roomId === firstRoom.roomId) {
+          renderChatMessages();
+        }
+      })
+      .catch(function () {});
   }
 
   function escapeHtml(str) {
@@ -570,6 +669,7 @@
     state.rooms = window.RunMatrixClient.getPersistedRoomsList();
     renderAccountScreen();
     renderRoomsList();
+    ensureDesktopActiveRoomSelected();
     checkTurnStatusAfterLogin();
     startSyncLoop();
 
@@ -686,7 +786,7 @@
   }
 
   // =========================================================================
-  // 3. CONTINUOUS /SYNC LOOP, LOCALSTORAGE CACHE & VISIBLE SYNC RETRY (Fix 1)
+  // 3. TWO-STAGE FILTERED /SYNC LOOP, BACKOFF & LOCALSTORAGE CACHE (Fix 1)
   // =========================================================================
 
   window.RunCryptoEngine.setOnRoomKeyReceived(function (newlyReceivedSessions) {
@@ -723,7 +823,12 @@
 
     if (state.syncError) {
       banner.style.display = "block";
-      textEl.textContent = "تعذر المزامنة (" + state.syncError + ") — جاري إعادة المحاولة…";
+      textEl.textContent =
+        "تعذر المزامنة (" +
+        state.syncError +
+        ") — إعادة المحاولة خلال " +
+        state.syncRetryDelaySec +
+        " ث…";
     } else {
       banner.style.display = "none";
       textEl.textContent = "";
@@ -731,6 +836,7 @@
   }
 
   function triggerImmediateSyncRetry() {
+    consecutiveSyncFailures = 0;
     state.syncError = null;
     updateSyncStatusBanner();
     renderRoomsList();
@@ -743,113 +849,181 @@
     }
   }
 
+  function mergeSyncResultIntoState(data, isInitialSyncBatch) {
+    state.initialSyncCompleted = true;
+    state.isSyncInProgress = false;
+    state.syncError = null;
+    updateSyncStatusBanner();
+
+    // 1. Merge timeline messages
+    var msgRoomIds = Object.keys(data.newMessagesByRoom || {});
+    for (var i = 0; i < msgRoomIds.length; i++) {
+      var rId = msgRoomIds[i];
+      var incomingMsgs = data.newMessagesByRoom[rId] || [];
+      if (!state.messagesByRoom[rId]) state.messagesByRoom[rId] = [];
+      var existingList = state.messagesByRoom[rId];
+      var seenIds = new Set(
+        existingList.map(function (m) {
+          return m.eventId;
+        })
+      );
+      incomingMsgs.forEach(function (m) {
+        if (!seenIds.has(m.eventId)) {
+          existingList.push(m);
+          if (!isInitialSyncBatch && !m.isOutgoing) {
+            triggerBrowserNotification(m.senderDisplayName, m.body);
+          }
+        }
+      });
+      existingList.sort(function (a, b) {
+        return (a.timestamp || 0) - (b.timestamp || 0);
+      });
+    }
+
+    // 2. Merge room summaries preserving cached last message & name across incremental sync batches
+    var roomMap = {};
+    state.rooms.forEach(function (r) {
+      roomMap[r.roomId] = r;
+    });
+    (data.rooms || []).forEach(function (updatedRoom) {
+      var prev = roomMap[updatedRoom.roomId];
+      if (prev) {
+        var mergedRoom = Object.assign({}, prev, updatedRoom);
+        if (!updatedRoom.lastMessageTimestamp && prev.lastMessageTimestamp) {
+          mergedRoom.lastMessageTimestamp = prev.lastMessageTimestamp;
+          mergedRoom.lastMessageSender = prev.lastMessageSender;
+          mergedRoom.lastMessageBody = prev.lastMessageBody;
+        }
+        if (
+          (!updatedRoom.name || updatedRoom.name === "غرفة Run") &&
+          prev.name &&
+          prev.name !== "غرفة Run"
+        ) {
+          mergedRoom.name = prev.name;
+        }
+        if (prev.isEncrypted && !updatedRoom.isEncrypted) {
+          mergedRoom.isEncrypted = true;
+          mergedRoom.encryptionStatusNote = null;
+        }
+        roomMap[updatedRoom.roomId] = mergedRoom;
+      } else {
+        roomMap[updatedRoom.roomId] = updatedRoom;
+      }
+    });
+
+    state.rooms = Object.values(roomMap).sort(function (a, b) {
+      return (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0);
+    });
+
+    // Persist updated room summaries in localStorage immediately
+    window.RunMatrixClient.savePersistedRoomsList(state.rooms);
+
+    if (state.activeRoom && roomMap[state.activeRoom.roomId]) {
+      state.activeRoom = roomMap[state.activeRoom.roomId];
+      updateChatHeader();
+      renderChatMessages();
+    } else {
+      ensureDesktopActiveRoomSelected();
+    }
+
+    if (Array.isArray(data.incomingFriendInvites) && data.incomingFriendInvites.length > 0) {
+      state.incomingFriendInvites = data.incomingFriendInvites;
+    } else if (isInitialSyncBatch) {
+      state.incomingFriendInvites = data.incomingFriendInvites || [];
+    }
+
+    if (Array.isArray(data.outgoingFriendInvites) && data.outgoingFriendInvites.length > 0) {
+      state.outgoingFriendInvites = data.outgoingFriendInvites;
+    } else if (isInitialSyncBatch) {
+      state.outgoingFriendInvites = data.outgoingFriendInvites || [];
+    }
+
+    if (Array.isArray(data.friends) && data.friends.length > 0) {
+      state.friends = data.friends;
+    }
+
+    renderRoomsList();
+    renderSearchLists();
+
+    // Process WebRTC signaling events
+    (data.signalingEvents || []).forEach(function (ev) {
+      handleSignalingEvent(ev);
+    });
+  }
+
   async function startSyncLoop() {
     if (syncLoopActive) return;
     syncLoopActive = true;
-    var sinceToken = null;
+    consecutiveSyncFailures = 0;
+
+    var sinceToken = window.RunMatrixClient.getPersistedSyncToken();
+    var completedPass2Timeline = Boolean(sinceToken && state.rooms.length > 0);
 
     while (syncLoopActive && window.RunMatrixClient.isLoggedIn()) {
       state.isSyncInProgress = true;
       renderRoomsList();
       try {
-        var data = await window.RunMatrixClient.sync(sinceToken, sinceToken ? 12000 : 0);
-        var isInitialSync = !sinceToken;
-        sinceToken = data.nextBatch;
-        state.initialSyncCompleted = true;
-        state.isSyncInProgress = false;
-        state.syncError = null;
-        updateSyncStatusBanner();
-
-        // Merge new timeline messages
-        var msgRoomIds = Object.keys(data.newMessagesByRoom || {});
-        for (var i = 0; i < msgRoomIds.length; i++) {
-          var rId = msgRoomIds[i];
-          var incomingMsgs = data.newMessagesByRoom[rId] || [];
-          if (!state.messagesByRoom[rId]) state.messagesByRoom[rId] = [];
-          var existingList = state.messagesByRoom[rId];
-          var seenIds = new Set(
-            existingList.map(function (m) {
-              return m.eventId;
-            })
-          );
-          incomingMsgs.forEach(function (m) {
-            if (!seenIds.has(m.eventId)) {
-              existingList.push(m);
-              if (!isInitialSync && !m.isOutgoing) {
-                triggerBrowserNotification(m.senderDisplayName, m.body);
-              }
+        // Stage 1: If no rooms or no sinceToken yet, execute the ultra-light first pass (~3 KB)
+        // so the rooms list appears immediately even on 12–30 KB/s mobile data!
+        if (!sinceToken && state.rooms.length === 0) {
+          var firstPassData = await window.RunMatrixClient.syncFirstPassLight();
+          if (firstPassData && Array.isArray(firstPassData.rooms)) {
+            mergeSyncResultIntoState(firstPassData, true);
+            if (firstPassData.nextBatch) {
+              sinceToken = firstPassData.nextBatch;
             }
-          });
-        }
-
-        // Merge room summaries preserving cached last message & name across incremental sync batches
-        var roomMap = {};
-        state.rooms.forEach(function (r) {
-          roomMap[r.roomId] = r;
-        });
-        (data.rooms || []).forEach(function (updatedRoom) {
-          var prev = roomMap[updatedRoom.roomId];
-          if (prev) {
-            var mergedRoom = Object.assign({}, prev, updatedRoom);
-            if (!updatedRoom.lastMessageTimestamp && prev.lastMessageTimestamp) {
-              mergedRoom.lastMessageTimestamp = prev.lastMessageTimestamp;
-              mergedRoom.lastMessageSender = prev.lastMessageSender;
-              mergedRoom.lastMessageBody = prev.lastMessageBody;
-            }
-            if (
-              (!updatedRoom.name || updatedRoom.name === "غرفة Run") &&
-              prev.name &&
-              prev.name !== "غرفة Run"
-            ) {
-              mergedRoom.name = prev.name;
-            }
-            if (prev.isEncrypted && !updatedRoom.isEncrypted) {
-              mergedRoom.isEncrypted = true;
-              mergedRoom.encryptionStatusNote = null;
-            }
-            roomMap[updatedRoom.roomId] = mergedRoom;
-          } else {
-            roomMap[updatedRoom.roomId] = updatedRoom;
           }
-        });
-
-        state.rooms = Object.values(roomMap).sort(function (a, b) {
-          return (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0);
-        });
-
-        // Persist updated room summaries in localStorage immediately (Fix 1.1)
-        window.RunMatrixClient.savePersistedRoomsList(state.rooms);
-
-        if (state.activeRoom && roomMap[state.activeRoom.roomId]) {
-          state.activeRoom = roomMap[state.activeRoom.roomId];
-          updateChatHeader();
-          renderChatMessages();
         }
 
-        state.incomingFriendInvites = data.incomingFriendInvites || [];
-        state.outgoingFriendInvites = data.outgoingFriendInvites || [];
-        state.friends = data.friends || [];
+        // Stage 2: Filtered timeline sync (10 messages per room, lazy_load_members: true)
+        var syncSinceArg = completedPass2Timeline ? sinceToken : null;
+        var syncTimeoutArg = completedPass2Timeline ? 12000 : 0;
+        var data = await window.RunMatrixClient.sync(syncSinceArg, syncTimeoutArg);
+        var wasInitialTimelinePass = !completedPass2Timeline;
+        completedPass2Timeline = true;
+        sinceToken = data.nextBatch || sinceToken;
+        consecutiveSyncFailures = 0;
 
-        renderRoomsList();
-        renderSearchLists();
+        mergeSyncResultIntoState(data, wasInitialTimelinePass);
 
-        // Process WebRTC signaling events
-        (data.signalingEvents || []).forEach(function (ev) {
-          handleSignalingEvent(ev);
-        });
+        // Stage 3: Lazily load member display names for small/DM rooms in the background
+        if (wasInitialTimelinePass && state.rooms.length > 0) {
+          window.RunMatrixClient.lazyLoadRoomMembersForSmallRooms(state.rooms)
+            .then(function (updatedNames) {
+              if (updatedNames) {
+                renderRoomsList();
+                updateChatHeader();
+              }
+            })
+            .catch(function () {});
+        }
       } catch (syncErr) {
-        console.warn("[RunSync] Sync failed:", syncErr && syncErr.name, syncErr && syncErr.message);
+        consecutiveSyncFailures += 1;
+        var backoffMs =
+          BACKOFF_DELAYS_MS[
+            Math.min(consecutiveSyncFailures - 1, BACKOFF_DELAYS_MS.length - 1)
+          ] || 3500;
+        state.syncRetryDelaySec = backoffMs / 1000;
+        console.warn(
+          "[RunSync] Sync failed (attempt " +
+            consecutiveSyncFailures +
+            ", retry in " +
+            state.syncRetryDelaySec +
+            "s):",
+          syncErr && syncErr.name,
+          syncErr && syncErr.message
+        );
         state.isSyncInProgress = false;
         state.syncError = (syncErr && syncErr.message) || "انقطاع في الشبكة";
         updateSyncStatusBanner();
         renderRoomsList();
 
-        // Wait 3.5s OR wake immediately when user clicks «إعادة المحاولة»
+        // Exponential backoff (3.5s -> 7s -> 15s) OR wake immediately when user clicks «إعادة المحاولة»
         await new Promise(function (resolve) {
           var timer = setTimeout(function () {
             syncRetryWakeResolver = null;
             resolve();
-          }, 3500);
+          }, backoffMs);
           syncRetryWakeResolver = function () {
             clearTimeout(timer);
             resolve();
@@ -857,7 +1031,7 @@
         });
       }
       await new Promise(function (r) {
-        setTimeout(r, 700);
+        setTimeout(r, 600);
       });
     }
     syncLoopActive = false;
@@ -875,7 +1049,7 @@
   }
 
   // =========================================================================
-  // 4. ROOMS LIST, FULL-SCREEN CHAT & ROOM INFO / DEVICE VERIFICATION
+  // 4. ROOMS LIST, CHAT PANE & ROOM INFO / DEVICE VERIFICATION
   // =========================================================================
 
   function renderRoomsList() {
@@ -891,13 +1065,13 @@
       unreadBadge.textContent = String(totalUnread);
     }
 
-    // Fix 1.2: NEVER show «لا توجد غرف» before the first sync has completed!
+    // NEVER show «لا توجد غرف» before the first sync has completed!
     if (state.rooms.length === 0) {
       if (!state.initialSyncCompleted) {
         container.innerHTML =
           '<div class="empty-note" style="text-align:center;padding:38px 24px">' +
           '<div style="font-size:15px;font-weight:600;color:var(--accent);margin-bottom:6px">جاري تحميل الغرف…</div>' +
-          '<div style="font-size:12.5px;color:var(--app-ink-soft)">يتم الآن مزامنة غرفك ومحادثاتك المشفرة من حسابك.</div>' +
+          '<div style="font-size:12.5px;color:var(--app-ink-soft)">يتم الآن مزامنة غرفك ومحادثاتك المشفرة (مزامنة سريعة ومصفاة).</div>' +
           "</div>";
         return;
       }
@@ -921,13 +1095,17 @@
 
     function buildRoomItemHtml(r) {
       var lockIcon = r.isEncrypted ? "🔒 " : "";
+      var isSelected = Boolean(state.activeRoom && state.activeRoom.roomId === r.roomId);
+      var rowClass = isSelected ? "room-row active-room" : "room-row";
       var preview = r.lastMessageSender
         ? "<b>" + escapeHtml(r.lastMessageSender) + ":</b> " + escapeHtml(r.lastMessageBody)
         : escapeHtml(r.lastMessageBody);
       var unreadHtml =
         r.unreadCount > 0 ? '<span class="unread-badge">' + r.unreadCount + "</span>" : "";
       return (
-        '<button class="room-row" type="button" data-room-id="' +
+        '<button class="' +
+        rowClass +
+        '" type="button" data-room-id="' +
         escapeHtml(r.roomId) +
         '">' +
         buildAvatarHtml(r.name, r.avatarColor, 48, r.isDirect ? r.peerPresence : null) +
@@ -977,6 +1155,7 @@
 
   async function openRoomChat(room) {
     state.activeRoom = room;
+    renderRoomsList();
     updateChatHeader();
     renderChatMessages();
     showScreen("chat");
@@ -990,7 +1169,7 @@
     updateChatHeader();
 
     try {
-      var history = await window.RunMatrixClient.fetchRoomMessages(room.roomId, 60);
+      var history = await window.RunMatrixClient.fetchRoomMessages(room.roomId, 30);
       var currentList = state.messagesByRoom[room.roomId] || [];
       var existingIds = new Set(
         currentList.map(function (m) {
@@ -1014,13 +1193,30 @@
 
   function updateChatHeader() {
     var r = state.activeRoom;
-    if (!r) return;
-    document.getElementById("chatHeaderName").textContent = r.name;
+    var nameEl = document.getElementById("chatHeaderName");
     var avatarEl = document.getElementById("chatHeaderAvatar");
+    var badge = document.getElementById("chatHeaderLockBadge");
+    var statusEl = document.getElementById("chatHeaderStatus");
+    var inp = document.getElementById("inpChatMessage");
+    if (!nameEl || !avatarEl || !badge || !statusEl) return;
+
+    if (!r) {
+      nameEl.textContent = "المحادثة";
+      avatarEl.textContent = "R";
+      avatarEl.style.background = "#8a6d3b";
+      badge.className = "chip ok";
+      badge.textContent = "🔒 Olm/Megolm";
+      statusEl.textContent = "اختر غرفة أو صديقًا من القائمة الجانبية لبدء المراسلة المشفرة";
+      if (inp) {
+        inp.placeholder = "اختر غرفة من القائمة الجانبية لكتابة رسالة…";
+      }
+      return;
+    }
+
+    nameEl.textContent = r.name;
     avatarEl.textContent = r.name.trim().replace(/^@/, "").charAt(0).toUpperCase() || "R";
     avatarEl.style.background = r.avatarColor || "#8a6d3b";
 
-    var badge = document.getElementById("chatHeaderLockBadge");
     if (r.isEncrypted) {
       badge.className = "chip ok";
       badge.textContent = "🔒 مشفرة E2E";
@@ -1034,10 +1230,9 @@
         ? "متصل الآن"
         : r.roomCode
       : r.memberCount + " عضوًا · الكود " + r.roomCode;
-    document.getElementById("chatHeaderStatus").textContent =
+    statusEl.textContent =
       baseStatus + (r.isEncrypted ? " · تشفير Olm/Megolm" : " · غير مشفرة");
 
-    var inp = document.getElementById("inpChatMessage");
     if (inp) {
       inp.placeholder = r.isEncrypted ? "اكتب رسالة مشفرة…" : "اكتب رسالة (غير مشفرة)…";
     }
@@ -1045,8 +1240,17 @@
 
   function renderChatMessages() {
     var container = document.getElementById("chatMessagesContainer");
+    if (!container) return;
     var r = state.activeRoom;
-    if (!container || !r) return;
+
+    if (!r) {
+      container.innerHTML =
+        '<div class="empty-note" style="margin:auto;text-align:center;max-width:380px;padding:32px 24px">' +
+        '<div style="font-size:16px;font-weight:600;color:var(--accent);margin-bottom:8px">اختر غرفة لبدء المراسلة</div>' +
+        '<div style="font-size:13px;color:var(--app-ink-soft);line-height:1.7">اختر أي غرفة أو محادثة خاصة من الشريط الجانبي لعرض الرسائل المشفرة أو بدء مكالمة صوت وفيديو 1-إلى-1.</div>' +
+        "</div>";
+      return;
+    }
 
     var bannerHtml = r.isEncrypted
       ? '<div class="enc-banner">🔒 تشفير من الطرف إلى الطرف مفعّل (Olm/Megolm) — متوافق مع Element</div>'
@@ -1112,7 +1316,11 @@
   async function onSendChatMessage() {
     var r = state.activeRoom;
     var inp = document.getElementById("inpChatMessage");
-    if (!r || !inp) return;
+    if (!r) {
+      showToast("يرجى اختيار غرفة أو محادثة أولاً", true);
+      return;
+    }
+    if (!inp) return;
     var text = inp.value.trim();
     if (!text) return;
     inp.value = "";
@@ -1141,7 +1349,10 @@
 
   async function openRoomInfoScreen() {
     var r = state.activeRoom;
-    if (!r) return;
+    if (!r) {
+      showToast("اختر غرفة أولاً لعرض تفاصيلها", false);
+      return;
+    }
 
     document.getElementById("riTitle").textContent = r.name;
     document.getElementById("riSubtitle").textContent = r.isDirect
@@ -1326,7 +1537,6 @@
       }
     }
 
-    // If the user typed a room code pattern (e.g. AGEN-9641), automatically switch to ROOMS tab so results are immediately visible
     if (window.RUN_CONFIG.looksLikeRoomCode(clean) && state.searchTab !== "ROOMS") {
       setSearchTab("ROOMS");
     }
@@ -1499,7 +1709,7 @@
         .join("");
     }
 
-    // 5. Public Rooms results (passes both roomId and roomCode for resilient first-try join!)
+    // 5. Public Rooms results
     if (state.publicRoomResults.length === 0) {
       pubRoomsEl.innerHTML = '<div class="empty-note">لا توجد غرف عامة مطابقة.</div>';
     } else {
@@ -1847,7 +2057,10 @@
 
   async function startCallInActiveRoom(isVideoRequested) {
     var r = state.activeRoom;
-    if (!r) return;
+    if (!r) {
+      showToast("اختر غرفة أو محادثة أولاً لبدء المكالمة", true);
+      return;
+    }
     var effectiveVideo = Boolean(isVideoRequested && state.callQuality !== "AUDIO_ONLY");
     var callId = "runweb_call_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
 
@@ -2241,6 +2454,19 @@
       .getElementById("btnRetrySyncNow")
       .addEventListener("click", triggerImmediateSyncRetry);
 
+    // Responsive resize handler (Fix 2: keep desktop two-pane conversation populated)
+    window.addEventListener("resize", function () {
+      ensureDesktopActiveRoomSelected();
+      var isAuthFlow =
+        state.currentScreen === "login" ||
+        state.currentScreen === "pin" ||
+        state.currentScreen === "restored";
+      if (!isAuthFlow) {
+        updateChatHeader();
+        renderChatMessages();
+      }
+    });
+
     // Auth & UIAA Registration
     document.getElementById("tabModeLogin").addEventListener("click", function () {
       setAuthMode("login");
@@ -2533,6 +2759,7 @@
       await window.RunMatrixClient.logout();
       state.account = null;
       state.rooms = [];
+      state.activeRoom = null;
       state.initialSyncCompleted = false;
       state.syncError = null;
       state.messagesByRoom = {};
@@ -2554,6 +2781,7 @@
     if (window.RunMatrixClient.isLoggedIn()) {
       state.initialSyncCompleted = false;
       state.rooms = window.RunMatrixClient.getPersistedRoomsList();
+      ensureDesktopActiveRoomSelected();
       showScreen("rooms");
       renderRoomsList();
     } else {
@@ -2569,6 +2797,7 @@
         if (state.rooms.length === 0) {
           state.rooms = window.RunMatrixClient.getPersistedRoomsList();
         }
+        ensureDesktopActiveRoomSelected();
         renderAccountScreen();
         showScreen("rooms");
         renderRoomsList();

@@ -1,6 +1,10 @@
 /* ==========================================================================
-   Run v2 Web — Design B Stylesheet (Warm Night #171310 + #E8A33D & Warm Paper #FBF6EE)
-   Single-column Telegram-style responsive layout for mobile & desktop
+   Run v2 Web (v2.3.2) — Design B Stylesheet
+   Warm Night (#171310 + #E8A33D) & Warm Paper (#FBF6EE)
+   Responsive Layout:
+   - <= 540px (Mobile): Single-column phone layout (unchanged)
+   - 541px–1023px (Tablet): Wider single-column layout (max-width: 720px)
+   - >= 1024px (Desktop/PC): Two-pane layout (Left sidebar ~336px + Right chat pane 1fr)
    ========================================================================== */
 
 :root,
@@ -53,7 +57,9 @@ html,
 body {
   margin: 0;
   padding: 0;
+  width: 100%;
   height: 100%;
+  overflow-x: hidden;
   font-family: "IBM Plex Sans Arabic", system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--page-bg);
   color: var(--app-ink);
@@ -71,7 +77,7 @@ button {
   cursor: pointer;
 }
 
-/* ---------- Single-Column Responsive App Shell ---------- */
+/* ---------- Base App Shell (Mobile default <= 540px) ---------- */
 .app-shell {
   width: 100%;
   max-width: 520px;
@@ -143,15 +149,19 @@ button {
   position: relative;
   flex: 1;
   overflow: hidden;
+  min-width: 0;
+  min-height: 0;
 }
 
 .screen {
   position: absolute;
   inset: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   display: none;
   flex-direction: column;
   scrollbar-width: thin;
+  min-width: 0;
 }
 
 .screen.active {
@@ -770,11 +780,17 @@ button {
   border: none;
   text-align: start;
   color: var(--app-ink);
+  border-inline-start: 3px solid transparent;
 }
 
 .room-row:hover,
 .room-row:active {
   background: var(--app-surface-2);
+}
+
+.room-row.active-room {
+  background: var(--app-surface-2);
+  border-inline-start-color: var(--accent);
 }
 
 .room-row .meta {
@@ -827,7 +843,7 @@ button {
   flex: none;
 }
 
-/* ---------- Full-Screen Chat (Small 13.5px Text) ---------- */
+/* ---------- Full-Screen / Right-Pane Chat (Small 13.5px Text on Phone) ---------- */
 .chat-head {
   display: flex;
   align-items: center;
@@ -835,6 +851,7 @@ button {
   padding: 10px 14px;
   border-bottom: 1px solid var(--app-line);
   background: var(--app-bg);
+  min-width: 0;
 }
 
 .chat-head .meta {
@@ -866,10 +883,12 @@ button {
 .msgs {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 12px 16px 8px;
   display: flex;
   flex-direction: column;
   gap: 5px;
+  min-width: 0;
 }
 
 .enc-banner {
@@ -881,6 +900,7 @@ button {
   padding: 4px 12px;
   margin: 4px 0 8px;
   text-align: center;
+  max-width: 100%;
 }
 
 .enc-banner.unencrypted {
@@ -888,7 +908,7 @@ button {
   border: 1px solid rgba(217, 83, 79, 0.35);
 }
 
-/* Compact Chat Message Font (13.5px, weight 400) as required by Design B */
+/* Compact Chat Message Font (13.5px, weight 400 on phone) as required by Design B */
 .msg {
   max-width: 78%;
   padding: 7px 12px;
@@ -952,10 +972,12 @@ button {
   padding: 10px 12px;
   border-top: 1px solid var(--app-line);
   background: var(--app-bg);
+  min-width: 0;
 }
 
 .composer .box {
   flex: 1;
+  min-width: 0;
   background: var(--app-surface-2);
   border-radius: 999px;
   display: flex;
@@ -1296,4 +1318,250 @@ button {
   align-items: center;
   justify-content: center;
   padding: 0 4px;
+}
+
+/* ==========================================================================
+   RESPONSIVE BREAKPOINT 2: TABLET (541px – 1023px)
+   Wider single-column layout (max-width: 720px) with comfortable spacing
+   ========================================================================== */
+@media (min-width: 541px) and (max-width: 1023px) {
+  .app-shell {
+    max-width: 720px;
+  }
+
+  .app-head {
+    padding: 18px 26px 10px;
+  }
+
+  .search-bar-btn,
+  .search-input-wrap {
+    margin: 8px 26px 12px;
+    width: calc(100% - 52px);
+    padding: 11px 16px;
+  }
+
+  .spaces {
+    padding: 4px 26px 12px;
+    gap: 16px;
+  }
+
+  .sec-label {
+    padding: 14px 26px 6px;
+  }
+
+  .room-row,
+  .result-row,
+  .set-row {
+    padding: 12px 26px;
+  }
+
+  .invite-box,
+  .profile-card {
+    margin-inline: 26px;
+  }
+
+  .chat-head {
+    padding: 12px 22px;
+  }
+
+  .msgs {
+    padding: 16px 24px 12px;
+    gap: 7px;
+  }
+
+  .msg {
+    max-width: 72%;
+  }
+
+  .composer {
+    padding: 12px 22px;
+  }
+}
+
+/* ==========================================================================
+   RESPONSIVE BREAKPOINT 3: DESKTOP / PC (>= 1024px)
+   Two-Pane Layout:
+   - Left Sidebar (~336px): Rooms list / Search / Calls / Account + Bottom Tabs
+   - Right Conversation Pane (1fr): Active Chat / Room Info / Active Call
+   - Full width (no 520px cap, zero wasted side margins)
+   ========================================================================== */
+@media (min-width: 1024px) {
+  .app-shell {
+    max-width: 100%;
+    width: 100%;
+    height: 100dvh;
+    margin: 0;
+    border-inline: none;
+    box-shadow: none;
+  }
+
+  /* When on Login / PIN / Restored screens on Desktop: clean centered wide card */
+  .app-shell:not(.authenticated-layout) {
+    background: radial-gradient(circle at 50% 18%, #241c16 0%, var(--page-bg) 75%);
+    justify-content: center;
+    align-items: center;
+    padding: 24px;
+  }
+
+  [data-theme="light"] .app-shell:not(.authenticated-layout) {
+    background: radial-gradient(circle at 50% 18%, #fbf6ee 0%, var(--page-bg) 75%);
+  }
+
+  .app-shell:not(.authenticated-layout) > .screens {
+    width: 100%;
+    max-width: 560px;
+    max-height: min(92dvh, 780px);
+    background: var(--app-bg);
+    border: 1px solid var(--app-line);
+    border-radius: 22px;
+    box-shadow: var(--shadow);
+  }
+
+  /* Two-Pane Split Grid when Authenticated on Desktop (>= 1024px) */
+  .app-shell.authenticated-layout {
+    display: grid;
+    direction: ltr; /* Places 336px sidebar on the left and 1fr chat pane on the right */
+    grid-template-columns: 336px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "sidebar main"
+      "tabbar  main";
+    background: var(--app-bg);
+  }
+
+  .app-shell.authenticated-layout > .status-toast {
+    direction: rtl;
+    max-width: 560px;
+    margin-inline: auto;
+  }
+
+  .app-shell.authenticated-layout > .screens {
+    display: contents;
+  }
+
+  .app-shell.authenticated-layout .screen {
+    position: relative;
+    inset: auto;
+    direction: rtl;
+    height: 100%;
+    min-height: 0;
+    min-width: 0;
+    display: none;
+  }
+
+  /* Left Sidebar Pane Screens */
+  .app-shell.authenticated-layout #scr-rooms,
+  .app-shell.authenticated-layout #scr-search,
+  .app-shell.authenticated-layout #scr-create,
+  .app-shell.authenticated-layout #scr-calls,
+  .app-shell.authenticated-layout #scr-settings {
+    grid-area: sidebar;
+    border-right: 1px solid var(--app-line);
+    background: var(--app-surface);
+  }
+
+  .app-shell.authenticated-layout .screen.desktop-sidebar-active {
+    display: flex;
+  }
+
+  /* Left Sidebar Bottom Navigation Tabs */
+  .app-shell.authenticated-layout > #bottomTabBar {
+    grid-area: tabbar;
+    direction: rtl;
+    display: flex !important;
+    border-right: 1px solid var(--app-line);
+    background: var(--app-surface);
+  }
+
+  /* Right Main Conversation Pane Screens */
+  .app-shell.authenticated-layout #scr-chat,
+  .app-shell.authenticated-layout #scr-roominfo,
+  .app-shell.authenticated-layout #scr-call {
+    grid-area: main;
+    background: var(--app-bg);
+  }
+
+  .app-shell.authenticated-layout .screen.desktop-main-active {
+    display: flex;
+  }
+
+  /* Sidebar compact adjustments for 336px column */
+  .app-shell.authenticated-layout #scr-rooms .app-head,
+  .app-shell.authenticated-layout #scr-search .app-head,
+  .app-shell.authenticated-layout #scr-create .app-head,
+  .app-shell.authenticated-layout #scr-calls .app-head,
+  .app-shell.authenticated-layout #scr-settings .app-head {
+    padding: 14px 16px 8px;
+  }
+
+  .app-shell.authenticated-layout #scr-rooms .search-bar-btn,
+  .app-shell.authenticated-layout #scr-search .search-input-wrap {
+    margin: 6px 16px 10px;
+    width: calc(100% - 32px);
+  }
+
+  .app-shell.authenticated-layout #scr-rooms .spaces {
+    padding: 2px 16px 10px;
+    gap: 11px;
+  }
+
+  .app-shell.authenticated-layout #scr-rooms .room-row,
+  .app-shell.authenticated-layout #scr-search .result-row,
+  .app-shell.authenticated-layout #scr-settings .set-row {
+    padding: 10px 16px;
+  }
+
+  .app-shell.authenticated-layout #scr-rooms .invite-box,
+  .app-shell.authenticated-layout #scr-search .invite-box,
+  .app-shell.authenticated-layout #scr-settings .invite-box,
+  .app-shell.authenticated-layout #scr-settings .profile-card {
+    margin-inline: 16px;
+  }
+
+  /* Wide Right Conversation Pane adjustments */
+  .app-shell.authenticated-layout #scr-chat #btnChatBack {
+    display: none;
+  }
+
+  .app-shell.authenticated-layout #scr-chat .chat-head {
+    padding: 14px 26px;
+    gap: 12px;
+  }
+
+  .app-shell.authenticated-layout #scr-chat .chat-head .name {
+    font-size: 16px;
+  }
+
+  .app-shell.authenticated-layout #scr-chat .chat-head .status {
+    font-size: 12px;
+  }
+
+  .app-shell.authenticated-layout #scr-chat .msgs {
+    padding: 20px 32px 14px;
+    gap: 7px;
+  }
+
+  .app-shell.authenticated-layout #scr-chat .msg {
+    max-width: 65%;
+    font-size: 14px;
+    padding: 8px 14px;
+  }
+
+  .app-shell.authenticated-layout #scr-chat .composer {
+    padding: 14px 26px;
+    gap: 12px;
+  }
+
+  .app-shell.authenticated-layout #scr-chat .composer .box {
+    height: 46px;
+    padding: 0 18px;
+  }
+
+  .app-shell.authenticated-layout #scr-chat .composer input {
+    font-size: 14px;
+  }
+
+  .app-shell.authenticated-layout #scr-roominfo {
+    padding-inline: 12px;
+  }
 }
